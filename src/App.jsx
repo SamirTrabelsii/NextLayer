@@ -8,6 +8,7 @@ import Products from './pages/Products'
 import Clients from './pages/Clients'
 import Expenses from './pages/Expenses'
 import Ideas from './pages/Ideas'
+import Reseller from './pages/Reseller'
 
 export default function App() {
   return (
@@ -23,6 +24,7 @@ export default function App() {
           <Route path="clients" element={<Clients />} />
           <Route path="expenses" element={<Expenses />} />
           <Route path="ideas" element={<Ideas />} />
+          <Route path="reseller" element={<Reseller />} />
         </Route>
       </Routes>
     </BrowserRouter>

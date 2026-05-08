@@ -1,3 +1,478 @@
+import { useState, useEffect } from 'react'
+import { supabase } from '../lib/supabase'
+import { Plus, X, Trash2, Printer, Clock, Zap, ChevronRight } from 'lucide-react'
+
+const STATUSES = [
+    { key: 'queued', label: 'Queued', emoji: '⏳', color: 'bg-slate-100 text-slate-600' },
+    { key: 'printing', label: 'Printing', emoji: '🖨️', color: 'bg-yellow-100 text-yellow-700' },
+    { key: 'done', label: 'Done', emoji: '✅', color: 'bg-emerald-100 text-emerald-700' },
+    { key: 'failed', label: 'Failed', emoji: '❌', color: 'bg-red-100 text-red-600' },
+]
+
+const MATERIALS = ['PLA', 'PETG', 'ABS', 'TPU', 'Resin', 'Other']
+
+const FILAMENT_PRICE_PER_KG = 35 // TND — adjust to your real price
+const ELECTRICITY_PER_HOUR = 0.15 // TND — adjust to your rate
+
+const empty = {
+    order_id: '', product_id: '', description: '',
+    material: 'PLA', color: '', filament_grams: '',
+    print_time_hours: '', actual_cost: '', status: 'queued', notes: '',
+}
+
 export default function Productions() {
-    return <div className="text-2xl font-bold text-slate-700">🖨️ Productions — coming next</div>
+    const [productions, setProductions] = useState([])
+    const [orders, setOrders] = useState([])
+    const [products, setProducts] = useState([])
+    const [loading, setLoading] = useState(true)
+    const [showModal, setShowModal] = useState(false)
+    const [form, setForm] = useState(empty)
+    const [editing, setEditing] = useState(null)
+    const [deleting, setDeleting] = useState(null)
+    const [saving, setSaving] = useState(false)
+    const [filterStatus, setFilter] = useState('active')
+
+    useEffect(() => { fetchAll() }, [])
+
+    async function fetchAll() {
+        setLoading(true)
+        const [{ data: pr }, { data: or }, { data: pd }] = await Promise.all([
+            supabase.from('productions').select(`
+        *, orders(id, custom_description, type, clients(name)),
+        products(name)
+      `).order('created_at', { ascending: false }),
+            supabase.from('orders')
+                .select('id, custom_description, type, status, clients(name)')
+                .not('status', 'in', '("paid","cancelled","delivered")')
+                .order('created_at', { ascending: false }),
+            supabase.from('products').select('id, name').eq('is_active', true).order('name'),
+        ])
+        setProductions(pr || [])
+        setOrders(or || [])
+        setProducts(pd || [])
+        setLoading(false)
+    }
+
+    function openAdd() { setForm(empty); setEditing(null); setShowModal(true) }
+    function openEdit(p) { setForm({ ...p, order_id: p.order_id || '', product_id: p.product_id || '' }); setEditing(p.id); setShowModal(true) }
+    function closeModal() { setShowModal(false); setForm(empty); setEditing(null) }
+
+    function handleChange(e) {
+        const { name, value } = e.target
+        const updated = { ...form, [name]: value }
+
+        // Auto-calculate cost
+        if (name === 'filament_grams' || name === 'print_time_hours' || name === 'material') {
+            const grams = parseFloat(name === 'filament_grams' ? value : updated.filament_grams) || 0
+            const hours = parseFloat(name === 'print_time_hours' ? value : updated.print_time_hours) || 0
+            const filamentCost = (grams / 1000) * FILAMENT_PRICE_PER_KG
+            const electricityCost = hours * ELECTRICITY_PER_HOUR
+            updated.actual_cost = (filamentCost + electricityCost).toFixed(2)
+        }
+
+        // Auto-fill description from order
+        if (name === 'order_id' && value) {
+            const order = orders.find(o => o.id === value)
+            if (order && !updated.description) {
+                updated.description = order.custom_description || ''
+            }
+        }
+
+        setForm(updated)
+    }
+
+    async function saveProd() {
+        if (!form.description && !form.product_id) return
+        setSaving(true)
+        const payload = {
+            ...form,
+            order_id: form.order_id || null,
+            product_id: form.product_id || null,
+            filament_grams: parseFloat(form.filament_grams) || null,
+            print_time_hours: parseFloat(form.print_time_hours) || null,
+            actual_cost: parseFloat(form.actual_cost) || null,
+        }
+        if (editing) {
+            await supabase.from('productions').update(payload).eq('id', editing)
+        } else {
+            await supabase.from('productions').insert([payload])
+        }
+        setSaving(false)
+        closeModal()
+        fetchAll()
+    }
+
+    async function updateStatus(id, status) {
+        await supabase.from('productions').update({ status }).eq('id', id)
+        fetchAll()
+    }
+
+    async function deleteProd(id) {
+        await supabase.from('productions').delete().eq('id', id)
+        setDeleting(null)
+        fetchAll()
+    }
+
+    const filtered = productions.filter(p => {
+        if (filterStatus === 'active') return ['queued', 'printing'].includes(p.status)
+        if (filterStatus === 'done') return p.status === 'done'
+        return true
+    })
+
+    // Stats
+    const queued = productions.filter(p => p.status === 'queued').length
+    const printing = productions.filter(p => p.status === 'printing').length
+    const done = productions.filter(p => p.status === 'done').length
+    const totalGrams = productions
+        .filter(p => p.status === 'done')
+        .reduce((s, p) => s + (p.filament_grams || 0), 0)
+    const totalCost = productions
+        .filter(p => p.status === 'done')
+        .reduce((s, p) => s + (p.actual_cost || 0), 0)
+
+    const si = key => STATUSES.find(s => s.key === key) || STATUSES[0]
+
+    return (
+        <div className="max-w-4xl mx-auto">
+
+            {/* Header */}
+            <div className="flex items-center justify-between mb-6">
+                <div>
+                    <h1 className="text-2xl font-bold text-slate-800">Productions</h1>
+                    <p className="text-sm text-slate-500">Print job tracker</p>
+                </div>
+                <button onClick={openAdd}
+                    className="flex items-center gap-2 bg-sky-500 hover:bg-sky-600 text-white px-4 py-2.5 rounded-xl font-medium transition-colors">
+                    <Plus size={18} /> New Job
+                </button>
+            </div>
+
+            {/* Stats */}
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-6">
+                <div className="bg-white rounded-2xl border border-slate-100 shadow-sm p-4 text-center">
+                    <p className="text-2xl font-bold text-slate-700">{queued}</p>
+                    <p className="text-xs text-slate-400 mt-0.5">⏳ Queued</p>
+                </div>
+                <div className="bg-white rounded-2xl border border-slate-100 shadow-sm p-4 text-center">
+                    <p className="text-2xl font-bold text-yellow-500">{printing}</p>
+                    <p className="text-xs text-slate-400 mt-0.5">🖨️ Printing</p>
+                </div>
+                <div className="bg-white rounded-2xl border border-slate-100 shadow-sm p-4 text-center">
+                    <p className="text-2xl font-bold text-emerald-500">{done}</p>
+                    <p className="text-xs text-slate-400 mt-0.5">✅ Done</p>
+                </div>
+                <div className="bg-white rounded-2xl border border-slate-100 shadow-sm p-4 text-center">
+                    <p className="text-2xl font-bold text-sky-500">{totalGrams.toFixed(0)}g</p>
+                    <p className="text-xs text-slate-400 mt-0.5">🧵 Total Used</p>
+                </div>
+            </div>
+
+            {/* Filters */}
+            <div className="flex gap-2 mb-5">
+                {[
+                    { key: 'active', label: '🔥 Active' },
+                    { key: 'done', label: '✅ Done' },
+                    { key: 'all', label: 'All' },
+                ].map(f => (
+                    <button key={f.key} onClick={() => setFilter(f.key)}
+                        className={`px-3 py-2 rounded-xl text-sm font-medium transition-colors
+              ${filterStatus === f.key ? 'bg-sky-500 text-white' : 'bg-white border border-slate-200 text-slate-600 hover:bg-slate-50'}`}>
+                        {f.label}
+                    </button>
+                ))}
+            </div>
+
+            {/* Print Queue — priority view when active filter */}
+            {filterStatus === 'active' && filtered.length > 0 && (
+                <div className="bg-amber-50 border border-amber-200 rounded-2xl p-4 mb-5">
+                    <p className="text-sm font-bold text-amber-700 mb-3">🖨️ Print Queue — {filtered.length} job{filtered.length > 1 ? 's' : ''}</p>
+                    <div className="space-y-2">
+                        {filtered
+                            .sort((a, b) => {
+                                // Printing first, then queued
+                                if (a.status === 'printing' && b.status !== 'printing') return -1
+                                if (b.status === 'printing' && a.status !== 'printing') return 1
+                                return 0
+                            })
+                            .map((p, idx) => (
+                                <div key={p.id} className="flex items-center gap-3 bg-white rounded-xl px-3 py-2.5 border border-amber-100">
+                                    <span className="text-slate-400 text-xs font-bold w-4">{idx + 1}</span>
+                                    <div className="flex-1 min-w-0">
+                                        <p className="text-sm font-medium text-slate-800 truncate">
+                                            {p.products?.name || p.description || 'Custom job'}
+                                        </p>
+                                        <p className="text-xs text-slate-400">
+                                            {p.orders?.clients?.name ? `📋 ${p.orders.clients.name}` : 'No order linked'}
+                                            {p.material ? ` · ${p.material}` : ''}
+                                        </p>
+                                    </div>
+                                    <span className={`text-xs px-2 py-1 rounded-lg font-medium flex-shrink-0 ${si(p.status).color}`}>
+                                        {si(p.status).emoji}
+                                    </span>
+                                </div>
+                            ))}
+                    </div>
+                </div>
+            )}
+
+            {/* Productions list */}
+            {loading ? (
+                <div className="text-center py-20 text-slate-400">Loading...</div>
+            ) : filtered.length === 0 ? (
+                <div className="text-center py-20">
+                    <Printer size={48} className="mx-auto text-slate-300 mb-3" />
+                    <p className="text-slate-400 font-medium">No productions here</p>
+                    <p className="text-slate-400 text-sm">Log a print job to get started</p>
+                </div>
+            ) : (
+                <div className="flex flex-col gap-3">
+                    {filtered.map(p => {
+                        const s = si(p.status)
+                        return (
+                            <div key={p.id} className="bg-white rounded-2xl border border-slate-100 shadow-sm p-4">
+                                <div className="flex items-start justify-between mb-3">
+                                    <div className="flex-1 min-w-0">
+                                        <div className="flex items-center gap-2 mb-1">
+                                            <span className={`text-xs font-semibold px-2 py-0.5 rounded-full ${s.color}`}>
+                                                {s.emoji} {s.label}
+                                            </span>
+                                            {p.material && (
+                                                <span className="text-xs px-2 py-0.5 rounded-full bg-slate-100 text-slate-500">
+                                                    {p.material}
+                                                </span>
+                                            )}
+                                            {p.color && (
+                                                <span className="text-xs px-2 py-0.5 rounded-full bg-slate-100 text-slate-500">
+                                                    {p.color}
+                                                </span>
+                                            )}
+                                        </div>
+                                        <h3 className="font-semibold text-slate-800">
+                                            {p.products?.name || p.description || 'Custom job'}
+                                        </h3>
+                                        {p.orders?.clients?.name && (
+                                            <p className="text-xs text-slate-400 mt-0.5">
+                                                📋 Order: {p.orders.clients.name}
+                                            </p>
+                                        )}
+                                    </div>
+                                    <div className="flex gap-1 ml-2">
+                                        <button onClick={() => openEdit(p)}
+                                            className="p-1.5 text-slate-400 hover:text-sky-500 hover:bg-sky-50 rounded-lg transition-colors text-xs">
+                                            ✏️
+                                        </button>
+                                        <button onClick={() => setDeleting(p)}
+                                            className="p-1.5 text-slate-400 hover:text-red-500 hover:bg-red-50 rounded-lg transition-colors">
+                                            <Trash2 size={14} />
+                                        </button>
+                                    </div>
+                                </div>
+
+                                {/* Stats row */}
+                                <div className="flex flex-wrap gap-4 text-sm py-3 border-t border-b border-slate-50 mb-3">
+                                    {p.filament_grams && (
+                                        <div className="flex items-center gap-1.5 text-slate-600">
+                                            <span className="text-base">🧵</span>
+                                            <span className="font-semibold">{p.filament_grams}g</span>
+                                            <span className="text-slate-400 text-xs">filament</span>
+                                        </div>
+                                    )}
+                                    {p.print_time_hours && (
+                                        <div className="flex items-center gap-1.5 text-slate-600">
+                                            <Clock size={14} className="text-slate-400" />
+                                            <span className="font-semibold">{p.print_time_hours}h</span>
+                                            <span className="text-slate-400 text-xs">print time</span>
+                                        </div>
+                                    )}
+                                    {p.actual_cost && (
+                                        <div className="flex items-center gap-1.5 text-slate-600">
+                                            <Zap size={14} className="text-slate-400" />
+                                            <span className="font-semibold">{p.actual_cost} TND</span>
+                                            <span className="text-slate-400 text-xs">cost</span>
+                                        </div>
+                                    )}
+                                </div>
+
+                                {/* Quick status buttons */}
+                                <div className="flex gap-2">
+                                    {STATUSES.filter(s => s.key !== p.status).map(s => (
+                                        <button key={s.key}
+                                            onClick={() => updateStatus(p.id, s.key)}
+                                            className="flex-1 py-1.5 text-xs font-medium bg-slate-50 hover:bg-slate-100 rounded-lg border border-slate-200 text-slate-500 transition-colors">
+                                            {s.emoji} {s.label}
+                                        </button>
+                                    ))}
+                                </div>
+
+                                {p.notes && (
+                                    <p className="text-xs text-slate-400 mt-2 italic">"{p.notes}"</p>
+                                )}
+                            </div>
+                        )
+                    })}
+                </div>
+            )}
+
+            {/* Add/Edit Modal */}
+            {showModal && (
+                <div className="fixed inset-0 bg-black/40 z-50 flex items-end sm:items-center justify-center p-0 sm:p-4">
+                    <div className="bg-white w-full sm:max-w-lg rounded-t-3xl sm:rounded-2xl shadow-2xl max-h-[92vh] overflow-y-auto">
+                        <div className="flex items-center justify-between p-5 border-b sticky top-0 bg-white rounded-t-3xl z-10">
+                            <h2 className="text-lg font-bold text-slate-800">
+                                {editing ? 'Edit Job' : 'New Print Job'}
+                            </h2>
+                            <button onClick={closeModal} className="p-2 hover:bg-slate-100 rounded-xl">
+                                <X size={20} />
+                            </button>
+                        </div>
+
+                        <div className="p-5 space-y-4">
+
+                            {/* Link to order */}
+                            <div>
+                                <label className="text-sm font-medium text-slate-700 block mb-1">
+                                    Linked Order <span className="text-slate-400 font-normal">(optional)</span>
+                                </label>
+                                <select name="order_id" value={form.order_id} onChange={handleChange}
+                                    className="w-full border border-slate-200 rounded-xl px-3 py-2.5 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-sky-300">
+                                    <option value="">No order linked (stock production)</option>
+                                    {orders.map(o => (
+                                        <option key={o.id} value={o.id}>
+                                            {o.clients?.name} — {o.custom_description || 'Standard order'}
+                                        </option>
+                                    ))}
+                                </select>
+                            </div>
+
+                            {/* Product or description */}
+                            <div>
+                                <label className="text-sm font-medium text-slate-700 block mb-1">Product</label>
+                                <select name="product_id" value={form.product_id} onChange={handleChange}
+                                    className="w-full border border-slate-200 rounded-xl px-3 py-2.5 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-sky-300">
+                                    <option value="">Custom / not in catalogue</option>
+                                    {products.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
+                                </select>
+                            </div>
+
+                            {!form.product_id && (
+                                <div>
+                                    <label className="text-sm font-medium text-slate-700 block mb-1">Description *</label>
+                                    <input name="description" value={form.description} onChange={handleChange}
+                                        placeholder="What are you printing?"
+                                        className="w-full border border-slate-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-sky-300" />
+                                </div>
+                            )}
+
+                            {/* Material + Color */}
+                            <div className="grid grid-cols-2 gap-3">
+                                <div>
+                                    <label className="text-sm font-medium text-slate-700 block mb-1">Material</label>
+                                    <select name="material" value={form.material} onChange={handleChange}
+                                        className="w-full border border-slate-200 rounded-xl px-3 py-2.5 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-sky-300">
+                                        {MATERIALS.map(m => <option key={m}>{m}</option>)}
+                                    </select>
+                                </div>
+                                <div>
+                                    <label className="text-sm font-medium text-slate-700 block mb-1">Color</label>
+                                    <input name="color" value={form.color} onChange={handleChange}
+                                        placeholder="e.g. Black, Red..."
+                                        className="w-full border border-slate-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-sky-300" />
+                                </div>
+                            </div>
+
+                            {/* Filament + Time */}
+                            <div className="grid grid-cols-2 gap-3">
+                                <div>
+                                    <label className="text-sm font-medium text-slate-700 block mb-1">Filament used (g)</label>
+                                    <input name="filament_grams" type="number" value={form.filament_grams} onChange={handleChange}
+                                        placeholder="e.g. 85"
+                                        className="w-full border border-slate-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-sky-300" />
+                                </div>
+                                <div>
+                                    <label className="text-sm font-medium text-slate-700 block mb-1">Print time (h)</label>
+                                    <input name="print_time_hours" type="number" value={form.print_time_hours} onChange={handleChange}
+                                        placeholder="e.g. 3.5"
+                                        className="w-full border border-slate-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-sky-300" />
+                                </div>
+                            </div>
+
+                            {/* Auto-calculated cost */}
+                            <div>
+                                <label className="text-sm font-medium text-slate-700 block mb-1">
+                                    Production Cost (TND)
+                                    <span className="text-xs text-sky-500 ml-1">auto-calculated</span>
+                                </label>
+                                <input name="actual_cost" type="number" value={form.actual_cost} onChange={handleChange}
+                                    placeholder="0.00"
+                                    className="w-full border border-slate-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-sky-300 bg-sky-50 font-semibold" />
+                                <p className="text-xs text-slate-400 mt-1">
+                                    Based on {FILAMENT_PRICE_PER_KG} TND/kg filament + {ELECTRICITY_PER_HOUR} TND/hr electricity
+                                </p>
+                            </div>
+
+                            {/* Status */}
+                            <div>
+                                <label className="text-sm font-medium text-slate-700 block mb-2">Status</label>
+                                <div className="grid grid-cols-2 gap-2">
+                                    {STATUSES.map(s => (
+                                        <button key={s.key}
+                                            onClick={() => setForm(f => ({ ...f, status: s.key }))}
+                                            className={`py-2.5 rounded-xl text-sm font-medium border transition-all
+                        ${form.status === s.key
+                                                    ? 'border-sky-400 bg-sky-50 text-sky-700 ring-2 ring-sky-200'
+                                                    : 'border-slate-200 bg-white text-slate-500 hover:bg-slate-50'}`}>
+                                            {s.emoji} {s.label}
+                                        </button>
+                                    ))}
+                                </div>
+                            </div>
+
+                            {/* Notes */}
+                            <div>
+                                <label className="text-sm font-medium text-slate-700 block mb-1">Notes</label>
+                                <textarea name="notes" value={form.notes} onChange={handleChange}
+                                    placeholder="Any notes about this print job..."
+                                    rows={2}
+                                    className="w-full border border-slate-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-sky-300 resize-none" />
+                            </div>
+                        </div>
+
+                        <div className="p-5 pt-0 flex gap-3">
+                            <button onClick={closeModal}
+                                className="flex-1 py-3 border border-slate-200 rounded-xl text-sm font-medium hover:bg-slate-50">
+                                Cancel
+                            </button>
+                            <button onClick={saveProd}
+                                disabled={saving || (!form.description && !form.product_id)}
+                                className="flex-1 py-3 bg-sky-500 hover:bg-sky-600 disabled:opacity-50 text-white rounded-xl text-sm font-medium">
+                                {saving ? 'Saving...' : editing ? 'Save Changes' : 'Create Job'}
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            {/* Delete confirm */}
+            {deleting && (
+                <div className="fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4">
+                    <div className="bg-white rounded-2xl shadow-2xl p-6 max-w-sm w-full">
+                        <h3 className="font-bold text-slate-800 text-lg mb-1">Delete job?</h3>
+                        <p className="text-slate-500 text-sm mb-5">
+                            "<span className="font-medium">{deleting.products?.name || deleting.description}</span>" will be removed.
+                        </p>
+                        <div className="flex gap-3">
+                            <button onClick={() => setDeleting(null)}
+                                className="flex-1 py-2.5 border border-slate-200 rounded-xl text-sm font-medium hover:bg-slate-50">
+                                Cancel
+                            </button>
+                            <button onClick={() => deleteProd(deleting.id)}
+                                className="flex-1 py-2.5 bg-red-500 hover:bg-red-600 text-white rounded-xl text-sm font-medium">
+                                Delete
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
+        </div>
+    )
 }

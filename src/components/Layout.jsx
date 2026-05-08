@@ -1,5 +1,5 @@
 import { Outlet, NavLink } from 'react-router-dom'
-import { LayoutDashboard, ShoppingCart, Box, Users, Receipt, Lightbulb, Printer, Package } from 'lucide-react'
+import { LayoutDashboard, ShoppingCart, Box, Users, Receipt, Lightbulb, Printer, Package, Handshake } from 'lucide-react'
 
 const nav = [
     { to: '/dashboard', icon: LayoutDashboard, label: 'Dashboard' },
@@ -10,6 +10,7 @@ const nav = [
     { to: '/clients', icon: Users, label: 'Clients' },
     { to: '/expenses', icon: Receipt, label: 'Expenses' },
     { to: '/ideas', icon: Lightbulb, label: 'Ideas' },
+    { to: '/reseller', icon: Handshake, label: 'Reseller' },
 ]
 
 export default function Layout() {
