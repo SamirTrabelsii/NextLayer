@@ -280,7 +280,7 @@ export default function Stock() {
       {/* Manual Adjustment Modal */}
       {showModal && (
         <div className="fixed inset-0 bg-black/40 z-50 flex items-end sm:items-center justify-center p-0 sm:p-4">
-          <div className="bg-white w-full sm:max-w-md rounded-t-3xl sm:rounded-2xl shadow-2xl max-h-[92vh] overflow-y-auto">
+          <div className="bg-white w-full sm:max-w-md rounded-t-3xl sm:rounded-2xl shadow-2xl max-h-[85vh] sm:max-h-[92vh] overflow-y-auto mb-16 sm:mb-0">
             <div className="flex items-center justify-between p-5 border-b sticky top-0 bg-white rounded-t-3xl z-10">
               <h2 className="text-lg font-bold text-slate-800">Manual Stock Adjustment</h2>
               <button onClick={() => { setShowModal(false); setForm(emptyForm); setError('') }}

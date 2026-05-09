@@ -1,267 +1,443 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 import { supabase } from '../lib/supabase'
-import { Plus, X, Search, ChevronRight, Trash2, ArrowRight, Phone, UserPlus, PackagePlus } from 'lucide-react'
+import {
+    Plus, X, Search, ChevronRight, Trash2,
+    ArrowRight, Phone, UserPlus, PackagePlus, AlertTriangle
+} from 'lucide-react'
 
+// ─── CONSTANTS ────────────────────────────────────────────────
 const STATUSES = [
     { key: 'new', label: 'New', emoji: '🆕', color: 'bg-slate-100 text-slate-600', dot: 'bg-slate-400' },
     { key: 'designing', label: 'Designing', emoji: '✏️', color: 'bg-blue-100 text-blue-700', dot: 'bg-blue-400' },
     { key: 'quoted', label: 'Quoted', emoji: '💬', color: 'bg-purple-100 text-purple-700', dot: 'bg-purple-400' },
     { key: 'confirmed', label: 'Confirmed', emoji: '✅', color: 'bg-sky-100 text-sky-700', dot: 'bg-sky-400' },
     { key: 'in_production', label: 'In Production', emoji: '🖨️', color: 'bg-yellow-100 text-yellow-700', dot: 'bg-yellow-400' },
+    { key: 'waiting_restock', label: 'Waiting Restock', emoji: '⏸️', color: 'bg-pink-100 text-pink-700', dot: 'bg-pink-400' },
     { key: 'ready', label: 'Ready', emoji: '📦', color: 'bg-orange-100 text-orange-700', dot: 'bg-orange-400' },
     { key: 'delivered', label: 'Delivered', emoji: '🚚', color: 'bg-indigo-100 text-indigo-700', dot: 'bg-indigo-400' },
     { key: 'paid', label: 'Paid', emoji: '💰', color: 'bg-emerald-100 text-emerald-700', dot: 'bg-emerald-400' },
     { key: 'cancelled', label: 'Cancelled', emoji: '❌', color: 'bg-red-100 text-red-600', dot: 'bg-red-400' },
 ]
 
-const FLOW = ['new', 'designing', 'quoted', 'confirmed', 'in_production', 'ready', 'delivered', 'paid']
-const ORDER_TO_PROD = { in_production: 'printing', ready: 'done', cancelled: 'failed' }
+// Flows per type
+const FLOW_CUSTOM = ['new', 'designing', 'quoted', 'confirmed', 'in_production', 'ready', 'delivered', 'paid']
+const FLOW_STANDARD = ['new', 'ready', 'delivered', 'paid']
+const ACTIVE_STATUSES = ['new', 'designing', 'quoted', 'confirmed', 'in_production', 'ready', 'delivered', 'waiting_restock']
+const TERMINAL = ['paid', 'cancelled']
 
+const si = key => STATUSES.find(s => s.key === key) ?? STATUSES[0]
+
+const getFlow = type => type === 'standard' ? FLOW_STANDARD : FLOW_CUSTOM
+
+const getNextStatus = (order) => {
+    if (order.status === 'waiting_restock') return 'ready'
+    const flow = getFlow(order.type)
+    const idx = flow.indexOf(order.status)
+    if (idx < 0 || idx >= flow.length - 1) return null
+    return flow[idx + 1]
+}
+
+// ─── EMPTY FORMS ──────────────────────────────────────────────
 const emptyForm = { type: 'custom', client_id: '', custom_description: '', dimensions: '', reference_notes: '', deadline: '', total_price: '', notes: '', status: 'new' }
 const emptyItem = { product_id: '', custom_description: '', quantity: 1, unit_price: '' }
 const emptyClient = { name: '', phone: '', email: '' }
 const emptyProduct = { name: '', category: 'Custom Orders', selling_price: '', production_cost: '' }
 const CATEGORIES = ['Keychains', 'Clickers', 'Decorations', 'Custom Orders']
 
+// ─── COMPONENT ────────────────────────────────────────────────
 export default function Orders() {
     const [orders, setOrders] = useState([])
     const [clients, setClients] = useState([])
     const [products, setProducts] = useState([])
     const [loading, setLoading] = useState(true)
+    const [error, setError] = useState('')
+
+    // UI state
     const [search, setSearch] = useState('')
     const [filterStatus, setFilter] = useState('active')
     const [showModal, setShowModal] = useState(false)
     const [selected, setSelected] = useState(null)
+    const [deleting, setDeleting] = useState(null)
+
+    // Form state
     const [form, setForm] = useState(emptyForm)
     const [items, setItems] = useState([{ ...emptyItem }])
     const [saving, setSaving] = useState(false)
-    const [deleting, setDeleting] = useState(null)
+
+    // Inline creation
     const [showNewClient, setShowNewClient] = useState(false)
     const [newClient, setNewClient] = useState(emptyClient)
     const [showNewProduct, setShowNewProduct] = useState(null)
     const [newProduct, setNewProduct] = useState(emptyProduct)
     const [savingInline, setSavingInline] = useState(false)
+
+    // Client search dropdown
     const [clientSearch, setClientSearch] = useState('')
     const [showClientDrop, setShowClientDrop] = useState(false)
 
-    useEffect(() => { fetchAll() }, [])
-
-    async function fetchAll() {
+    // ─── DATA FETCHING ──────────────────────────────────────────
+    const fetchAll = useCallback(async () => {
         setLoading(true)
-        const [{ data: o }, { data: c }, { data: p }] = await Promise.all([
-            supabase.from('orders').select(`*, clients(name,phone), order_items(*, products(name))`).order('created_at', { ascending: false }),
-            supabase.from('clients').select('id,name,phone').order('name'),
-            supabase.from('products').select('id,name,selling_price,category').eq('is_active', true).order('name'),
-        ])
-        setOrders(o || [])
-        setClients(c || [])
-        setProducts(p || [])
-        setLoading(false)
+        setError('')
+        try {
+            const [{ data: o, error: e1 }, { data: c }, { data: p }] = await Promise.all([
+                supabase.from('orders').select(`
+          id, type, status, total_price, is_paid, deadline, notes,
+          custom_description, dimensions, reference_notes, created_at,
+          clients(id, name, phone),
+          order_items(id, quantity, unit_price, custom_description, product_id, products(id, name))
+        `).order('created_at', { ascending: false }),
+                supabase.from('clients').select('id, name, phone').order('name'),
+                supabase.from('products').select('id, name, selling_price, category').eq('is_active', true).order('name'),
+            ])
+            if (e1) throw e1
+            setOrders(o ?? [])
+            setClients(c ?? [])
+            setProducts(p ?? [])
+        } catch (err) {
+            setError('Failed to load orders. Please refresh.')
+            console.error(err)
+        } finally {
+            setLoading(false)
+        }
+    }, [])
+
+    useEffect(() => { fetchAll() }, [fetchAll])
+
+    // ─── HELPERS ────────────────────────────────────────────────
+    const fmt = d => d
+        ? new Date(d).toLocaleDateString('en-GB', { day: '2-digit', month: 'short' })
+        : null
+
+    const isOverdue = o =>
+        o.deadline &&
+        !TERMINAL.includes(o.status) &&
+        new Date(o.deadline) < new Date()
+
+    const calcTotal = its =>
+        its.reduce((s, i) => s + ((parseFloat(i.unit_price) || 0) * (parseInt(i.quantity) || 1)), 0)
+
+    const orderLabel = o => {
+        if (o.custom_description) return o.custom_description
+        const names = (o.order_items || [])
+            .map(i => i.products?.name || i.custom_description)
+            .filter(Boolean)
+        return names.length ? names.join(', ') : '—'
     }
 
-    const si = key => STATUSES.find(s => s.key === key) || STATUSES[0]
-
+    // ─── MODAL MANAGEMENT ───────────────────────────────────────
     function openAdd() {
-        setForm(emptyForm); setItems([{ ...emptyItem }])
-        setSelected(null); setClientSearch(''); setShowModal(true)
-    }
-    function closeModal() {
-        setShowModal(false); setShowNewClient(false)
-        setShowNewProduct(null); setClientSearch('')
+        setForm(emptyForm)
+        setItems([{ ...emptyItem }])
+        setSelected(null)
+        setClientSearch('')
+        setShowNewClient(false)
+        setShowNewProduct(null)
+        setError('')
+        setShowModal(true)
     }
 
+    function closeModal() {
+        setShowModal(false)
+        setShowNewClient(false)
+        setShowNewProduct(null)
+        setClientSearch('')
+        setError('')
+    }
+
+    function closeDetail() { setSelected(null) }
+
+    // ─── INLINE CLIENT CREATE ────────────────────────────────────
     async function createClientInline() {
         if (!newClient.name.trim()) return
         setSavingInline(true)
-        const { data } = await supabase.from('clients').insert([newClient]).select().single()
-        if (data) {
-            await fetchAll()
+        try {
+            const { data, error } = await supabase.from('clients').insert([newClient]).select().single()
+            if (error) throw error
+            setClients(prev => [...prev, data].sort((a, b) => a.name.localeCompare(b.name)))
             setForm(f => ({ ...f, client_id: data.id }))
             setClientSearch(data.name)
+            setShowNewClient(false)
+            setNewClient(emptyClient)
+        } catch (err) {
+            console.error(err)
+        } finally {
+            setSavingInline(false)
         }
-        setNewClient(emptyClient); setShowNewClient(false); setSavingInline(false)
     }
 
+    // ─── INLINE PRODUCT CREATE ───────────────────────────────────
     async function createProductInline(itemIdx) {
         if (!newProduct.name.trim()) return
         setSavingInline(true)
-        const { data } = await supabase.from('products').insert([{
-            ...newProduct,
-            selling_price: parseFloat(newProduct.selling_price) || null,
-            production_cost: parseFloat(newProduct.production_cost) || null,
-            is_active: true,
-        }]).select().single()
-        if (data) { await fetchAll(); updateItem(itemIdx, 'product_id', data.id) }
-        setNewProduct(emptyProduct); setShowNewProduct(null); setSavingInline(false)
+        try {
+            const { data, error } = await supabase.from('products').insert([{
+                name: newProduct.name,
+                category: newProduct.category,
+                selling_price: parseFloat(newProduct.selling_price) || null,
+                production_cost: parseFloat(newProduct.production_cost) || null,
+                is_active: true,
+            }]).select().single()
+            if (error) throw error
+            setProducts(prev => [...prev, data].sort((a, b) => a.name.localeCompare(b.name)))
+            updateItem(itemIdx, 'product_id', data.id)
+            if (data.selling_price) updateItem(itemIdx, 'unit_price', data.selling_price)
+            setShowNewProduct(null)
+            setNewProduct(emptyProduct)
+        } catch (err) {
+            console.error(err)
+        } finally {
+            setSavingInline(false)
+        }
     }
 
+    // ─── ITEM MANAGEMENT ─────────────────────────────────────────
     function updateItem(idx, field, val) {
         setItems(prev => {
-            const u = [...prev]
-            u[idx] = { ...u[idx], [field]: val }
-            if (field === 'product_id') {
+            const updated = [...prev]
+            updated[idx] = { ...updated[idx], [field]: val }
+            if (field === 'product_id' && val) {
                 const prod = products.find(p => p.id === val)
-                if (prod) u[idx].unit_price = prod.selling_price || ''
+                if (prod?.selling_price) updated[idx].unit_price = prod.selling_price
             }
-            return u
+            return updated
         })
     }
 
-    function calcTotal(its) {
-        return its.reduce((s, i) => s + ((parseFloat(i.unit_price) || 0) * (parseInt(i.quantity) || 1)), 0)
+    // ─── CHECK STOCK FOR STANDARD ORDERS ─────────────────────────
+    async function checkAndReduceStock(orderItems, orderId, clientName) {
+        const results = { allAvailable: true, stockOps: [] }
+        for (const item of orderItems.filter(i => i.product_id)) {
+            const qty = parseInt(item.quantity) || 1
+            const { data: stockRow } = await supabase
+                .from('stock').select('id, quantity_available')
+                .eq('product_id', item.product_id).single()
+            const available = stockRow?.quantity_available ?? 0
+            if (available < qty) {
+                results.allAvailable = false
+                break
+            }
+            results.stockOps.push({ stockRow, product_id: item.product_id, qty, orderId, clientName })
+        }
+        if (results.allAvailable) {
+            for (const op of results.stockOps) {
+                await supabase.from('stock').update({
+                    quantity_available: op.stockRow.quantity_available - op.qty,
+                    updated_at: new Date().toISOString(),
+                }).eq('id', op.stockRow.id)
+                await supabase.from('stock_movements').insert([{
+                    product_id: op.product_id,
+                    type: 'sold',
+                    quantity: op.qty,
+                    is_positive: false,
+                    order_id: op.orderId,
+                    notes: `Sold — ${op.clientName}`,
+                }])
+            }
+        }
+        return results.allAvailable
     }
 
-    // ── AUTO-CREATE PRODUCTION when order is saved ──
-    async function autoCreateProduction(order, orderItems) {
-        let description = ''
-        let product_id = null
-        let quantity = 1
-
-        if (order.type === 'custom') {
-            description = order.custom_description || 'Custom order'
-        } else {
-            // Standard: build description from items
-            description = orderItems
-                .map(i => {
-                    const prod = products.find(p => p.id === i.product_id)
-                    return prod ? `${i.quantity}× ${prod.name}` : i.custom_description
-                })
-                .filter(Boolean).join(', ')
-            // If single product, link it
-            if (orderItems.length === 1 && orderItems[0].product_id)
-                product_id = orderItems[0].product_id
-            quantity = orderItems.reduce((s, i) => s + (parseInt(i.quantity) || 1), 0)
-        }
-
+    // ─── AUTO-CREATE PRODUCTION (custom orders only) ──────────────
+    async function autoCreateProduction(order) {
+        const description = order.custom_description || 'Custom order'
         await supabase.from('productions').insert([{
             order_id: order.id,
             description,
-            product_id,
-            quantity,
+            product_id: null,
+            quantity: 1,
             status: 'queued',
             material: 'PLA',
         }])
     }
 
+    // ─── SAVE ORDER ───────────────────────────────────────────────
     async function saveOrder() {
         if (!form.client_id) return
         setSaving(true)
-        const total = form.type === 'standard'
-            ? calcTotal(items) || null
-            : (parseFloat(form.total_price) || null)
+        setError('')
+        try {
+            const client = clients.find(c => c.id === form.client_id)
+            const validItems = items.filter(i => i.product_id || i.custom_description.trim())
 
-        const { data: order } = await supabase.from('orders')
-            .insert([{ ...form, total_price: total }])
-            .select().single()
+            let initialStatus = form.status
+            let finalPrice = parseFloat(form.total_price) || null
 
-        let savedItems = []
-        if (order) {
             if (form.type === 'standard') {
-                const valid = items.filter(i => i.product_id || i.custom_description)
-                if (valid.length) {
-                    await supabase.from('order_items')
-                        .insert(valid.map(i => ({ ...i, order_id: order.id })))
-                    savedItems = valid
+                // Calculate total from items
+                finalPrice = calcTotal(validItems) || null
+                // Check stock to determine initial status
+                const hasStockItems = validItems.some(i => i.product_id)
+                if (hasStockItems) {
+                    // Check availability without reducing yet
+                    let allAvailable = true
+                    for (const item of validItems.filter(i => i.product_id)) {
+                        const qty = parseInt(item.quantity) || 1
+                        const { data: stockRow } = await supabase
+                            .from('stock').select('quantity_available')
+                            .eq('product_id', item.product_id).single()
+                        if ((stockRow?.quantity_available ?? 0) < qty) {
+                            allAvailable = false
+                            break
+                        }
+                    }
+                    initialStatus = allAvailable ? 'ready' : 'waiting_restock'
+                } else {
+                    initialStatus = 'ready'
                 }
             }
-            // Auto-create production
-            await autoCreateProduction(order, savedItems)
+
+            // Create the order
+            const { data: order, error: orderErr } = await supabase
+                .from('orders')
+                .insert([{
+                    type: form.type,
+                    client_id: form.client_id,
+                    status: initialStatus,
+                    total_price: finalPrice,
+                    deadline: form.deadline || null,
+                    notes: form.notes || null,
+                    custom_description: form.type === 'custom' ? form.custom_description : null,
+                    dimensions: form.type === 'custom' ? form.dimensions : null,
+                    reference_notes: form.type === 'custom' ? form.reference_notes : null,
+                    is_paid: false,
+                }])
+                .select().single()
+
+            if (orderErr) throw orderErr
+
+            // Save order items for standard orders
+            if (form.type === 'standard' && validItems.length > 0) {
+                const { error: itemsErr } = await supabase.from('order_items').insert(
+                    validItems.map(i => ({
+                        order_id: order.id,
+                        product_id: i.product_id || null,
+                        custom_description: i.custom_description || null,
+                        quantity: parseInt(i.quantity) || 1,
+                        unit_price: parseFloat(i.unit_price) || null,
+                    }))
+                )
+                if (itemsErr) throw itemsErr
+
+                // If ready, reduce stock now
+                if (initialStatus === 'ready') {
+                    await checkAndReduceStock(validItems, order.id, client?.name || '')
+                }
+            }
+
+            // Auto-create production for custom orders
+            if (form.type === 'custom') {
+                await autoCreateProduction(order)
+            }
+
+            closeModal()
+            await fetchAll()
+        } catch (err) {
+            console.error('Save order error:', err)
+            setError('Something went wrong. Please try again.')
+        } finally {
+            setSaving(false)
         }
-        setSaving(false); closeModal(); fetchAll()
     }
 
-    // ── SYNC PRODUCTION STATUS when order status changes ──
-    async function syncProduction(orderId, newOrderStatus) {
-        const prodStatus = ORDER_TO_PROD[newOrderStatus]
+    // ─── SYNC PRODUCTION WITH ORDER STATUS ───────────────────────
+    async function syncProduction(orderId, newStatus) {
+        const prodStatusMap = {
+            in_production: 'printing',
+            ready: 'done',
+            cancelled: 'failed',
+        }
+        const prodStatus = prodStatusMap[newStatus]
         if (!prodStatus) return
         await supabase.from('productions')
             .update({ status: prodStatus })
             .eq('order_id', orderId)
     }
 
-    // ── REDUCE STOCK when standard order is paid ──
-    async function reduceStockForOrder(order) {
-        if (order.type !== 'standard') return
-        const { data: orderItems } = await supabase
-            .from('order_items').select('*, products(id)')
-            .eq('order_id', order.id)
-        if (!orderItems) return
+    // ─── ADVANCE STATUS ───────────────────────────────────────────
+    async function advanceStatus(order) {
+        const next = getNextStatus(order)
+        if (!next) return
+        await applyStatusChange(order, next)
+    }
 
-        for (const item of orderItems) {
-            if (!item.product_id) continue
-            const qty = parseInt(item.quantity) || 1
-            const { data: stock } = await supabase
-                .from('stock').select('*').eq('product_id', item.product_id).single()
-            if (stock) {
-                await supabase.from('stock').update({
-                    quantity_available: Math.max(0, (stock.quantity_available || 0) - qty),
-                    updated_at: new Date().toISOString(),
-                }).eq('product_id', item.product_id)
-                // Log movement
-                await supabase.from('stock_movements').insert([{
-                    product_id: item.product_id,
-                    type: 'sold',
-                    quantity: qty,
-                    order_id: order.id,
-                    is_positive: false,
-                    notes: `Order sold — ${order.clients?.name || ''}`,
-                }])
+    async function applyStatusChange(order, next) {
+        setSaving(true)
+        setError('')
+        try {
+            // Special: waiting_restock → ready (must check + reduce stock)
+            if (order.status === 'waiting_restock' && next === 'ready') {
+                const { data: orderItems } = await supabase
+                    .from('order_items').select('*')
+                    .eq('order_id', order.id)
+                const client = clients.find(c => c.id === order.clients?.id) || order.clients
+                const stockOk = await checkAndReduceStock(orderItems || [], order.id, client?.name || '')
+                if (!stockOk) {
+                    setError('Still not enough stock for this order.')
+                    setSaving(false)
+                    return
+                }
             }
+
+            await supabase.from('orders').update({
+                status: next,
+                is_paid: next === 'paid',
+            }).eq('id', order.id)
+
+            // Sync production for custom orders
+            if (order.type === 'custom') {
+                await syncProduction(order.id, next)
+                // Auto-create production when confirmed (if not already exists)
+                if (next === 'confirmed') {
+                    const { data: existing } = await supabase
+                        .from('productions').select('id').eq('order_id', order.id).single()
+                    if (!existing) await autoCreateProduction(order)
+                }
+            }
+
+            // If selected panel is open, update it
+            if (selected?.id === order.id) {
+                setSelected(prev => ({ ...prev, status: next, is_paid: next === 'paid' }))
+            }
+
+            await fetchAll()
+        } catch (err) {
+            console.error('Status change error:', err)
+            setError('Failed to update status.')
+        } finally {
+            setSaving(false)
         }
     }
 
-    async function advanceStatus(order) {
-        const idx = FLOW.indexOf(order.status)
-        if (idx < 0 || idx >= FLOW.length - 1) return
-        const next = FLOW[idx + 1]
-        await supabase.from('orders')
-            .update({ status: next, is_paid: next === 'paid' })
-            .eq('id', order.id)
-        await syncProduction(order.id, next)
-        if (next === 'paid') await reduceStockForOrder(order)
-        fetchAll()
-        if (selected?.id === order.id) setSelected(p => ({ ...p, status: next }))
-    }
-
-    async function setStatus(id, status) {
-        const order = orders.find(o => o.id === id)
-        await supabase.from('orders')
-            .update({ status, is_paid: status === 'paid' })
-            .eq('id', id)
-        await syncProduction(id, status)
-        if (status === 'paid' && order) await reduceStockForOrder(order)
-        fetchAll()
-        if (selected?.id === id) setSelected(p => ({ ...p, status }))
-    }
-
+    // ─── DELETE ORDER ─────────────────────────────────────────────
     async function deleteOrder(id) {
-        // Productions cascade-deleted automatically by DB
-        await supabase.from('orders').delete().eq('id', id)
-        setDeleting(null); setSelected(null); fetchAll()
+        try {
+            await supabase.from('orders').delete().eq('id', id)
+            setDeleting(null)
+            setSelected(null)
+            await fetchAll()
+        } catch (err) {
+            console.error(err)
+        }
     }
 
-    const activeStatuses = ['new', 'designing', 'quoted', 'confirmed', 'in_production', 'ready', 'delivered']
-
+    // ─── FILTER ORDERS ────────────────────────────────────────────
     const filtered = orders.filter(o => {
-        const name = o.clients?.name?.toLowerCase() || ''
-        const desc = (o.custom_description || '').toLowerCase()
-        const matchSearch = name.includes(search.toLowerCase()) || desc.includes(search.toLowerCase())
-        if (filterStatus === 'active') return matchSearch && activeStatuses.includes(o.status)
-        if (filterStatus === 'paid') return matchSearch && o.status === 'paid'
-        if (filterStatus === 'cancelled') return matchSearch && o.status === 'cancelled'
-        return matchSearch
+        const term = search.toLowerCase()
+        const matchSearch =
+            (o.clients?.name || '').toLowerCase().includes(term) ||
+            (o.custom_description || '').toLowerCase().includes(term) ||
+            o.id.slice(0, 8).includes(term)
+        if (!matchSearch) return false
+        if (filterStatus === 'active') return ACTIVE_STATUSES.includes(o.status)
+        if (filterStatus === 'paid') return o.status === 'paid'
+        if (filterStatus === 'cancelled') return o.status === 'cancelled'
+        return true // 'all'
     })
 
-    const isOverdue = o =>
-        o.deadline && !['paid', 'delivered', 'cancelled'].includes(o.status) &&
-        new Date(o.deadline) < new Date()
-
-    const fmt = d => d ? new Date(d).toLocaleDateString('en-GB', { day: '2-digit', month: 'short' }) : null
-    const nextLabel = o => {
-        const idx = FLOW.indexOf(o.status)
-        if (idx < 0 || idx >= FLOW.length - 1) return null
-        return si(FLOW[idx + 1]).label
-    }
+    // Count per status (for header pills)
+    const countByStatus = key => orders.filter(o => o.status === key).length
+    const activeCount = orders.filter(o => ACTIVE_STATUSES.includes(o.status)).length
 
     const filteredClients = clients.filter(c =>
         c.name.toLowerCase().includes(clientSearch.toLowerCase()) ||
@@ -269,71 +445,119 @@ export default function Orders() {
     )
     const selectedClient = clients.find(c => c.id === form.client_id)
 
+    // ─────────────────────────────────────────────────────────────
+    // RENDER
+    // ─────────────────────────────────────────────────────────────
     return (
         <div className="max-w-4xl mx-auto">
 
+            {/* ── HEADER ── */}
             <div className="flex items-center justify-between mb-6">
                 <div>
                     <h1 className="text-2xl font-bold text-slate-800">Orders</h1>
-                    <p className="text-sm text-slate-500">
-                        {orders.filter(o => activeStatuses.includes(o.status)).length} active
-                    </p>
+                    <p className="text-sm text-slate-500">{activeCount} active</p>
                 </div>
                 <button onClick={openAdd}
-                    className="flex items-center gap-2 bg-sky-500 hover:bg-sky-600 text-white px-4 py-2.5 rounded-xl font-medium transition-colors">
+                    className="flex items-center gap-2 bg-sky-500 hover:bg-sky-600 text-white px-4 py-2.5 rounded-xl font-medium transition-colors shadow-sm">
                     <Plus size={18} /> New Order
                 </button>
             </div>
 
-            {/* Status counts */}
-            <div className="grid grid-cols-4 sm:grid-cols-8 gap-2 mb-5">
-                {STATUSES.filter(s => s.key !== 'cancelled').map(s => (
-                    <div key={s.key} className="bg-white rounded-xl border border-slate-100 p-2 text-center">
-                        <div className="text-base">{s.emoji}</div>
-                        <div className="text-sm font-bold text-slate-700">
-                            {orders.filter(o => o.status === s.key).length}
-                        </div>
-                        <div className="text-xs text-slate-400 hidden sm:block leading-tight">{s.label}</div>
-                    </div>
-                ))}
-            </div>
+            {/* ── GLOBAL ERROR ── */}
+            {error && (
+                <div className="flex items-center gap-2 bg-red-50 border border-red-200 rounded-xl p-3 mb-4 text-sm text-red-600">
+                    <AlertTriangle size={16} className="flex-shrink-0" />
+                    {error}
+                    <button onClick={() => setError('')} className="ml-auto text-red-400 hover:text-red-600">
+                        <X size={14} />
+                    </button>
+                </div>
+            )}
 
-            {/* Filters */}
-            <div className="flex flex-col sm:flex-row gap-3 mb-5">
-                <div className="flex gap-2">
-                    {[{ key: 'active', label: 'Active' }, { key: 'paid', label: 'Paid' }, { key: 'all', label: 'All' }].map(f => (
-                        <button key={f.key} onClick={() => setFilter(f.key)}
-                            className={`px-3 py-2 rounded-xl text-sm font-medium transition-colors
-                ${filterStatus === f.key ? 'bg-sky-500 text-white' : 'bg-white border border-slate-200 text-slate-600'}`}>
-                            {f.label}
+            {/* ── STATUS COUNTS — horizontal scrollable ── */}
+            <div className="flex gap-2 overflow-x-auto pb-2 mb-5" style={{ scrollbarWidth: 'none' }}>
+                {/* Active group */}
+                <button onClick={() => setFilter('active')}
+                    className={`flex-shrink-0 flex items-center gap-2 px-3 py-2 rounded-xl border text-sm font-medium transition-all
+            ${filterStatus === 'active' ? 'bg-sky-500 text-white border-sky-500' : 'bg-white border-slate-200 text-slate-600 hover:bg-slate-50'}`}>
+                    🔥 Active
+                    <span className={`text-xs px-1.5 py-0.5 rounded-full ${filterStatus === 'active' ? 'bg-white/30 text-white' : 'bg-slate-100 text-slate-600'}`}>
+                        {activeCount}
+                    </span>
+                </button>
+
+                {/* Individual status pills */}
+                {STATUSES.filter(s => !['cancelled', 'paid'].includes(s.key)).map(s => {
+                    const count = countByStatus(s.key)
+                    if (count === 0) return null
+                    return (
+                        <button key={s.key}
+                            onClick={() => setFilter(filterStatus === s.key ? 'active' : s.key)}
+                            className={`flex-shrink-0 flex items-center gap-1.5 px-3 py-2 rounded-xl border text-xs font-medium transition-all
+                ${filterStatus === s.key ? s.color + ' ring-2 ring-offset-1' : 'bg-white border-slate-200 text-slate-500 hover:bg-slate-50'}`}>
+                            {s.emoji} {s.label}
+                            <span className="bg-white/60 text-current px-1 rounded-full">{count}</span>
                         </button>
-                    ))}
-                </div>
-                <div className="relative flex-1">
-                    <Search size={15} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
-                    <input value={search} onChange={e => setSearch(e.target.value)}
-                        placeholder="Search by client or description..."
-                        className="w-full pl-9 pr-4 py-2.5 border border-slate-200 rounded-xl bg-white text-sm focus:outline-none focus:ring-2 focus:ring-sky-300" />
-                </div>
+                    )
+                })}
+
+                <div className="flex-shrink-0 w-px bg-slate-200 mx-1" />
+
+                <button onClick={() => setFilter('paid')}
+                    className={`flex-shrink-0 flex items-center gap-2 px-3 py-2 rounded-xl border text-sm font-medium transition-all
+            ${filterStatus === 'paid' ? 'bg-emerald-500 text-white border-emerald-500' : 'bg-white border-slate-200 text-slate-600 hover:bg-slate-50'}`}>
+                    💰 Paid
+                    <span className={`text-xs px-1.5 py-0.5 rounded-full ${filterStatus === 'paid' ? 'bg-white/30' : 'bg-slate-100 text-slate-600'}`}>
+                        {countByStatus('paid')}
+                    </span>
+                </button>
+
+                <button onClick={() => setFilter('all')}
+                    className={`flex-shrink-0 px-3 py-2 rounded-xl border text-sm font-medium transition-all
+            ${filterStatus === 'all' ? 'bg-slate-700 text-white border-slate-700' : 'bg-white border-slate-200 text-slate-600 hover:bg-slate-50'}`}>
+                    All ({orders.length})
+                </button>
             </div>
 
-            {/* Orders list */}
+            {/* ── SEARCH ── */}
+            <div className="relative mb-5">
+                <Search size={15} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
+                <input value={search} onChange={e => setSearch(e.target.value)}
+                    placeholder="Search by client name or description..."
+                    className="w-full pl-9 pr-4 py-2.5 border border-slate-200 rounded-xl bg-white text-sm focus:outline-none focus:ring-2 focus:ring-sky-300" />
+            </div>
+
+            {/* ── ORDERS LIST ── */}
             {loading ? (
                 <div className="text-center py-20 text-slate-400">Loading...</div>
             ) : filtered.length === 0 ? (
-                <div className="text-center py-20 text-slate-400">No orders found</div>
+                <div className="text-center py-20 text-slate-400">
+                    <p className="font-medium">No orders found</p>
+                    <p className="text-sm mt-1">
+                        {search ? 'Try a different search term' : 'Create your first order above'}
+                    </p>
+                </div>
             ) : (
                 <div className="flex flex-col gap-3">
                     {filtered.map(o => {
                         const s = si(o.status)
                         const overdue = isOverdue(o)
-                        const nl = nextLabel(o)
+                        const next = getNextStatus(o)
+                        const nextSi = next ? si(next) : null
+                        const flow = getFlow(o.type)
+                        const flowIdx = flow.indexOf(o.status)
+
                         return (
-                            <div key={o.id} className="bg-white rounded-2xl border border-slate-100 shadow-sm hover:shadow-md transition-all">
+                            <div key={o.id}
+                                className="bg-white rounded-2xl border border-slate-100 shadow-sm hover:shadow-md transition-shadow">
+
+                                {/* Card body — click to open detail */}
                                 <div className="p-4 cursor-pointer" onClick={() => setSelected(o)}>
-                                    <div className="flex items-start justify-between">
+                                    <div className="flex items-start justify-between gap-3">
                                         <div className="flex-1 min-w-0">
-                                            <div className="flex items-center gap-2 flex-wrap mb-1">
+
+                                            {/* Badges row */}
+                                            <div className="flex items-center gap-1.5 flex-wrap mb-1.5">
                                                 <span className={`text-xs font-semibold px-2 py-0.5 rounded-full ${s.color}`}>
                                                     {s.emoji} {s.label}
                                                 </span>
@@ -346,42 +570,82 @@ export default function Orders() {
                                                         ⚠️ Overdue
                                                     </span>
                                                 )}
+                                                {o.status === 'waiting_restock' && (
+                                                    <span className="text-xs px-2 py-0.5 rounded-full bg-pink-50 text-pink-500 border border-pink-200">
+                                                        Out of stock
+                                                    </span>
+                                                )}
                                             </div>
-                                            <h3 className="font-semibold text-slate-800">{o.clients?.name || '—'}</h3>
+
+                                            {/* Client + description */}
+                                            <p className="font-semibold text-slate-800 leading-tight">
+                                                {o.clients?.name || '—'}
+                                            </p>
                                             <p className="text-xs text-slate-400 mt-0.5 truncate">
-                                                {o.custom_description ||
-                                                    o.order_items?.map(i => i.products?.name || i.custom_description).filter(Boolean).join(', ') ||
-                                                    'No description'}
+                                                {orderLabel(o)}
                                             </p>
                                         </div>
-                                        <div className="text-right ml-3 flex-shrink-0">
+
+                                        {/* Price + deadline */}
+                                        <div className="text-right flex-shrink-0">
                                             <p className="font-bold text-slate-800">
-                                                {o.total_price ? `${o.total_price} TND` : <span className="text-slate-300 text-sm font-normal">TBD</span>}
+                                                {o.total_price
+                                                    ? `${parseFloat(o.total_price).toFixed(2)} TND`
+                                                    : <span className="text-slate-300 text-sm font-normal">TBD</span>}
                                             </p>
                                             {o.deadline && (
-                                                <p className={`text-xs mt-0.5 ${overdue ? 'text-red-500 font-medium' : 'text-slate-400'}`}>
+                                                <p className={`text-xs mt-0.5 ${overdue ? 'text-red-500 font-semibold' : 'text-slate-400'}`}>
                                                     📅 {fmt(o.deadline)}
                                                 </p>
                                             )}
                                         </div>
-                                        <ChevronRight size={16} className="text-slate-300 ml-2 mt-1 flex-shrink-0" />
+
+                                        <ChevronRight size={16} className="text-slate-300 mt-1 flex-shrink-0" />
                                     </div>
-                                    <div className="mt-3 flex gap-0.5">
-                                        {FLOW.map((key, idx) => {
-                                            const currentIdx = FLOW.indexOf(o.status)
-                                            return (
+
+                                    {/* Progress bar — only for non-terminal, non-waiting statuses */}
+                                    {!TERMINAL.includes(o.status) && o.status !== 'waiting_restock' && (
+                                        <div className="mt-3 flex gap-0.5">
+                                            {flow.map((key, idx) => (
                                                 <div key={key}
-                                                    className={`h-1 flex-1 rounded-full ${idx <= currentIdx ? si(key).dot : 'bg-slate-100'}`} />
-                                            )
-                                        })}
-                                    </div>
+                                                    className={`h-1 flex-1 rounded-full transition-colors
+                            ${idx <= flowIdx ? si(key).dot : 'bg-slate-100'}`} />
+                                            ))}
+                                        </div>
+                                    )}
+
+                                    {/* Waiting restock progress bar */}
+                                    {o.status === 'waiting_restock' && (
+                                        <div className="mt-3 h-1 w-full rounded-full bg-pink-100">
+                                            <div className="h-1 w-1/4 rounded-full bg-pink-400 animate-pulse" />
+                                        </div>
+                                    )}
                                 </div>
-                                {nl && (
+
+                                {/* Quick advance button */}
+                                {next && !TERMINAL.includes(o.status) && (
                                     <div className="px-4 pb-3">
-                                        <button onClick={e => { e.stopPropagation(); advanceStatus(o) }}
-                                            className="w-full py-2 bg-slate-50 hover:bg-sky-50 hover:text-sky-600 border border-slate-200 hover:border-sky-200 rounded-xl text-xs font-medium text-slate-500 transition-all flex items-center justify-center gap-1">
-                                            <ArrowRight size={13} /> Move to {nl}
+                                        <button
+                                            onClick={e => { e.stopPropagation(); advanceStatus(o) }}
+                                            disabled={saving}
+                                            className={`w-full py-2 rounded-xl text-xs font-semibold flex items-center justify-center gap-1.5 transition-all border
+                        ${o.status === 'waiting_restock'
+                                                    ? 'bg-pink-50 hover:bg-pink-100 text-pink-700 border-pink-200'
+                                                    : 'bg-slate-50 hover:bg-sky-50 hover:text-sky-600 border-slate-200 hover:border-sky-200 text-slate-500'}`}>
+                                            <ArrowRight size={13} />
+                                            {o.status === 'waiting_restock'
+                                                ? 'Stock arrived → Mark Ready'
+                                                : `Move to ${nextSi?.label}`}
                                         </button>
+                                    </div>
+                                )}
+
+                                {/* Paid indicator */}
+                                {o.status === 'paid' && (
+                                    <div className="px-4 pb-3">
+                                        <div className="w-full py-2 rounded-xl text-xs font-semibold text-center bg-emerald-50 text-emerald-600 border border-emerald-200">
+                                            ✅ Complete & Paid
+                                        </div>
                                     </div>
                                 )}
                             </div>
@@ -390,91 +654,122 @@ export default function Orders() {
                 </div>
             )}
 
-            {/* NEW ORDER MODAL */}
+            {/* ══════════════════════════════════════════════════════
+          NEW ORDER MODAL
+      ══════════════════════════════════════════════════════ */}
             {showModal && (
-                <div className="fixed inset-0 bg-black/40 z-50 flex items-end sm:items-center justify-center p-0 sm:p-4">
-                    <div className="bg-white w-full sm:max-w-lg rounded-t-3xl sm:rounded-2xl shadow-2xl max-h-[92vh] overflow-y-auto">
-                        <div className="flex items-center justify-between p-5 border-b sticky top-0 bg-white rounded-t-3xl z-10">
-                            <h2 className="text-lg font-bold text-slate-800">New Order</h2>
-                            <button onClick={closeModal} className="p-2 hover:bg-slate-100 rounded-xl"><X size={20} /></button>
-                        </div>
-                        <div className="p-5 space-y-4">
+                <div className="fixed inset-0 bg-black/50 z-50 flex items-end sm:items-center justify-center p-0 sm:p-4">
+                    <div className="bg-white w-full sm:max-w-lg rounded-t-3xl sm:rounded-2xl shadow-2xl
+            max-h-[85vh] sm:max-h-[92vh] overflow-y-auto mb-16 sm:mb-0">
 
-                            {/* Type */}
+                        <div className="flex items-center justify-between p-5 border-b border-slate-100 sticky top-0 bg-white rounded-t-3xl sm:rounded-t-2xl z-10">
+                            <h2 className="text-lg font-bold text-slate-800">New Order</h2>
+                            <button onClick={closeModal} className="p-2 hover:bg-slate-100 rounded-xl transition-colors">
+                                <X size={20} />
+                            </button>
+                        </div>
+
+                        <div className="p-5 space-y-5">
+
+                            {/* Type selector */}
                             <div className="grid grid-cols-2 gap-2">
-                                {[{ key: 'custom', label: '✏️ Custom', sub: 'Design required' }, { key: 'standard', label: '📦 Standard', sub: 'From catalogue' }].map(t => (
-                                    <button key={t.key} onClick={() => setForm(f => ({ ...f, type: t.key }))}
-                                        className={`p-3 rounded-xl border text-left transition-all
-                      ${form.type === t.key ? 'border-sky-400 bg-sky-50 ring-2 ring-sky-200' : 'border-slate-200 hover:bg-slate-50'}`}>
-                                        <p className="text-sm font-semibold text-slate-800">{t.label}</p>
-                                        <p className="text-xs text-slate-400">{t.sub}</p>
+                                {[
+                                    { key: 'custom', label: '✏️ Custom', sub: 'Design → Quote → Print' },
+                                    { key: 'standard', label: '📦 Standard', sub: 'From stock / catalogue' },
+                                ].map(t => (
+                                    <button key={t.key}
+                                        onClick={() => setForm(f => ({ ...f, type: t.key, status: 'new' }))}
+                                        className={`p-3 rounded-xl border-2 text-left transition-all
+                      ${form.type === t.key
+                                                ? 'border-sky-400 bg-sky-50'
+                                                : 'border-slate-200 hover:border-slate-300 hover:bg-slate-50'}`}>
+                                        <p className="text-sm font-bold text-slate-800">{t.label}</p>
+                                        <p className="text-xs text-slate-400 mt-0.5">{t.sub}</p>
                                     </button>
                                 ))}
                             </div>
 
-                            {/* Client */}
+                            {/* ── CLIENT SEARCH + INLINE CREATE ── */}
                             <div>
-                                <label className="text-sm font-medium text-slate-700 block mb-1">Client *</label>
+                                <label className="text-sm font-medium text-slate-700 block mb-1.5">Client *</label>
+
                                 {form.client_id && selectedClient ? (
-                                    <div className="flex items-center justify-between bg-sky-50 border border-sky-200 rounded-xl px-3 py-2.5">
+                                    <div className="flex items-center justify-between bg-sky-50 border-2 border-sky-200 rounded-xl px-3 py-2.5">
                                         <div>
-                                            <p className="text-sm font-semibold text-sky-800">{selectedClient.name}</p>
+                                            <p className="text-sm font-bold text-sky-800">{selectedClient.name}</p>
                                             {selectedClient.phone && <p className="text-xs text-sky-500">{selectedClient.phone}</p>}
                                         </div>
                                         <button onClick={() => { setForm(f => ({ ...f, client_id: '' })); setClientSearch('') }}
-                                            className="text-sky-400 hover:text-sky-600 p-1"><X size={14} /></button>
+                                            className="p-1 text-sky-400 hover:text-sky-700 rounded-lg">
+                                            <X size={14} />
+                                        </button>
                                     </div>
                                 ) : (
                                     <div className="relative">
-                                        <input value={clientSearch}
+                                        <input
+                                            value={clientSearch}
                                             onChange={e => { setClientSearch(e.target.value); setShowClientDrop(true) }}
                                             onFocus={() => setShowClientDrop(true)}
-                                            placeholder="Search or type client name..."
-                                            className="w-full border border-slate-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-sky-300" />
+                                            placeholder="Type to search or create..."
+                                            className="w-full border-2 border-slate-200 focus:border-sky-400 rounded-xl px-3 py-2.5 text-sm outline-none transition-colors" />
+
                                         {showClientDrop && (
-                                            <div className="absolute top-full left-0 right-0 mt-1 bg-white border border-slate-200 rounded-xl shadow-lg z-20 max-h-48 overflow-y-auto">
-                                                {filteredClients.map(c => (
-                                                    <button key={c.id}
-                                                        onClick={() => { setForm(f => ({ ...f, client_id: c.id })); setClientSearch(c.name); setShowClientDrop(false) }}
-                                                        className="w-full text-left px-3 py-2.5 hover:bg-sky-50 border-b border-slate-50 last:border-0">
-                                                        <p className="text-sm font-medium text-slate-800">{c.name}</p>
-                                                        {c.phone && <p className="text-xs text-slate-400">{c.phone}</p>}
-                                                    </button>
-                                                ))}
-                                                {filteredClients.length === 0 && (
-                                                    <div className="px-3 py-2 text-sm text-slate-400">No clients found</div>
-                                                )}
-                                                <button onClick={() => { setShowNewClient(true); setShowClientDrop(false) }}
-                                                    className="w-full text-left px-3 py-2.5 text-sky-600 hover:bg-sky-50 font-medium text-sm flex items-center gap-2 border-t border-slate-100">
+                                            <div className="absolute top-full left-0 right-0 mt-1 bg-white border border-slate-200 rounded-xl shadow-xl z-20 overflow-hidden">
+                                                <div className="max-h-40 overflow-y-auto">
+                                                    {filteredClients.length > 0 ? filteredClients.map(c => (
+                                                        <button key={c.id}
+                                                            onClick={() => {
+                                                                setForm(f => ({ ...f, client_id: c.id }))
+                                                                setClientSearch(c.name)
+                                                                setShowClientDrop(false)
+                                                            }}
+                                                            className="w-full text-left px-3 py-2.5 hover:bg-sky-50 border-b border-slate-50 last:border-0 transition-colors">
+                                                            <p className="text-sm font-medium text-slate-800">{c.name}</p>
+                                                            {c.phone && <p className="text-xs text-slate-400">{c.phone}</p>}
+                                                        </button>
+                                                    )) : (
+                                                        <div className="px-3 py-3 text-sm text-slate-400 text-center">
+                                                            {clientSearch ? 'No results' : 'Start typing to search'}
+                                                        </div>
+                                                    )}
+                                                </div>
+                                                <button
+                                                    onClick={() => { setShowNewClient(true); setShowClientDrop(false) }}
+                                                    className="w-full text-left px-3 py-2.5 text-sky-600 hover:bg-sky-50 font-semibold text-sm flex items-center gap-2 border-t border-slate-100 transition-colors">
                                                     <UserPlus size={14} />
-                                                    {clientSearch ? `Add "${clientSearch}" as new client` : 'Create new client'}
+                                                    {clientSearch ? `Create "${clientSearch}"` : 'Create new client'}
                                                 </button>
                                             </div>
                                         )}
                                     </div>
                                 )}
+
+                                {/* Inline client form */}
                                 {showNewClient && (
-                                    <div className="mt-2 bg-sky-50 border border-sky-200 rounded-xl p-3 space-y-2">
-                                        <p className="text-xs font-bold text-sky-700">New Client</p>
+                                    <div className="mt-2 bg-sky-50 border-2 border-sky-200 rounded-xl p-3 space-y-2">
+                                        <p className="text-xs font-bold text-sky-700 uppercase tracking-wider">New Client</p>
                                         <input value={newClient.name}
                                             onChange={e => setNewClient(f => ({ ...f, name: e.target.value }))}
                                             placeholder="Full name *"
-                                            className="w-full border border-sky-200 rounded-lg px-3 py-2 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-sky-300" />
+                                            className="w-full border border-sky-200 rounded-lg px-3 py-2 text-sm bg-white outline-none focus:ring-2 focus:ring-sky-300" />
                                         <div className="grid grid-cols-2 gap-2">
                                             <input value={newClient.phone}
                                                 onChange={e => setNewClient(f => ({ ...f, phone: e.target.value }))}
-                                                placeholder="Phone (+216...)"
-                                                className="w-full border border-sky-200 rounded-lg px-3 py-2 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-sky-300" />
+                                                placeholder="Phone"
+                                                className="border border-sky-200 rounded-lg px-3 py-2 text-sm bg-white outline-none" />
                                             <input value={newClient.email}
                                                 onChange={e => setNewClient(f => ({ ...f, email: e.target.value }))}
-                                                placeholder="Email (optional)"
-                                                className="w-full border border-sky-200 rounded-lg px-3 py-2 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-sky-300" />
+                                                placeholder="Email"
+                                                className="border border-sky-200 rounded-lg px-3 py-2 text-sm bg-white outline-none" />
                                         </div>
                                         <div className="flex gap-2">
                                             <button onClick={() => setShowNewClient(false)}
-                                                className="flex-1 py-2 text-xs border border-slate-200 rounded-lg hover:bg-white">Cancel</button>
-                                            <button onClick={createClientInline} disabled={savingInline || !newClient.name.trim()}
-                                                className="flex-1 py-2 text-xs bg-sky-500 text-white rounded-lg hover:bg-sky-600 disabled:opacity-50 font-medium">
+                                                className="flex-1 py-2 text-xs border border-slate-200 bg-white rounded-lg hover:bg-slate-50">
+                                                Cancel
+                                            </button>
+                                            <button onClick={createClientInline}
+                                                disabled={savingInline || !newClient.name.trim()}
+                                                className="flex-1 py-2 text-xs bg-sky-500 text-white rounded-lg hover:bg-sky-600 disabled:opacity-50 font-semibold">
                                                 {savingInline ? 'Creating...' : '+ Create & Select'}
                                             </button>
                                         </div>
@@ -482,191 +777,215 @@ export default function Orders() {
                                 )}
                             </div>
 
-                            {/* Custom fields */}
+                            {/* ── CUSTOM ORDER FIELDS ── */}
                             {form.type === 'custom' && (
-                                <>
+                                <div className="space-y-3">
                                     <div>
-                                        <label className="text-sm font-medium text-slate-700 block mb-1">What do they want? *</label>
+                                        <label className="text-sm font-medium text-slate-700 block mb-1.5">
+                                            What does the client want? *
+                                        </label>
                                         <textarea value={form.custom_description}
                                             onChange={e => setForm(f => ({ ...f, custom_description: e.target.value }))}
-                                            placeholder="Describe what the client wants..."
+                                            placeholder="Describe the product in detail..."
                                             rows={3}
-                                            className="w-full border border-slate-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-sky-300 resize-none" />
+                                            className="w-full border-2 border-slate-200 focus:border-sky-400 rounded-xl px-3 py-2.5 text-sm outline-none resize-none transition-colors" />
                                     </div>
                                     <div className="grid grid-cols-2 gap-3">
                                         <div>
-                                            <label className="text-sm font-medium text-slate-700 block mb-1">Dimensions</label>
+                                            <label className="text-sm font-medium text-slate-700 block mb-1.5">Dimensions</label>
                                             <input value={form.dimensions}
                                                 onChange={e => setForm(f => ({ ...f, dimensions: e.target.value }))}
                                                 placeholder="e.g. 10×5×3 cm"
-                                                className="w-full border border-slate-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-sky-300" />
+                                                className="w-full border-2 border-slate-200 focus:border-sky-400 rounded-xl px-3 py-2.5 text-sm outline-none transition-colors" />
                                         </div>
                                         <div>
-                                            <label className="text-sm font-medium text-slate-700 block mb-1">Price (TND)</label>
+                                            <label className="text-sm font-medium text-slate-700 block mb-1.5">
+                                                Price (TND)
+                                                <span className="text-slate-400 text-xs font-normal ml-1">optional</span>
+                                            </label>
                                             <input type="number" value={form.total_price}
                                                 onChange={e => setForm(f => ({ ...f, total_price: e.target.value }))}
-                                                placeholder="TBD if empty"
-                                                className="w-full border border-slate-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-sky-300" />
+                                                placeholder="TBD"
+                                                className="w-full border-2 border-slate-200 focus:border-sky-400 rounded-xl px-3 py-2.5 text-sm outline-none transition-colors" />
                                         </div>
                                     </div>
                                     <div>
-                                        <label className="text-sm font-medium text-slate-700 block mb-1">Reference / Instructions</label>
+                                        <label className="text-sm font-medium text-slate-700 block mb-1.5">Reference / Instructions</label>
                                         <textarea value={form.reference_notes}
                                             onChange={e => setForm(f => ({ ...f, reference_notes: e.target.value }))}
-                                            placeholder="Color, reference image link, special details..."
+                                            placeholder="Color, image reference, special requirements..."
                                             rows={2}
-                                            className="w-full border border-slate-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-sky-300 resize-none" />
+                                            className="w-full border-2 border-slate-200 focus:border-sky-400 rounded-xl px-3 py-2.5 text-sm outline-none resize-none transition-colors" />
                                     </div>
-                                </>
+                                    <div className="bg-violet-50 border border-violet-200 rounded-xl p-3">
+                                        <p className="text-xs text-violet-700 font-medium">
+                                            🖨️ A print job will be automatically queued for this order
+                                        </p>
+                                    </div>
+                                </div>
                             )}
 
-                            {/* Standard items */}
+                            {/* ── STANDARD ORDER ITEMS ── */}
                             {form.type === 'standard' && (
                                 <div>
                                     <label className="text-sm font-medium text-slate-700 block mb-2">Items</label>
                                     <div className="space-y-3">
                                         {items.map((item, idx) => (
-                                            <div key={idx} className="bg-slate-50 rounded-xl p-3 space-y-2">
+                                            <div key={idx} className="bg-slate-50 border border-slate-200 rounded-xl p-3 space-y-2">
                                                 <div className="flex gap-2 items-start">
-                                                    <div className="flex-1">
+                                                    <div className="flex-1 space-y-1">
                                                         <select value={item.product_id}
                                                             onChange={e => updateItem(idx, 'product_id', e.target.value)}
-                                                            className="w-full border border-slate-200 rounded-lg px-2 py-2 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-sky-300">
-                                                            <option value="">Custom / not in catalogue</option>
+                                                            className="w-full border border-slate-200 rounded-lg px-2 py-2 text-sm bg-white outline-none focus:ring-2 focus:ring-sky-300">
+                                                            <option value="">— Custom (not in catalogue) —</option>
                                                             {products.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
                                                         </select>
-                                                        <button onClick={() => setShowNewProduct(idx)}
-                                                            className="mt-1 text-xs text-sky-500 hover:text-sky-700 flex items-center gap-1">
-                                                            <PackagePlus size={12} /> Add new product to catalogue
+                                                        <button onClick={() => setShowNewProduct(showNewProduct === idx ? null : idx)}
+                                                            className="text-xs text-sky-500 hover:text-sky-700 flex items-center gap-1 pl-1">
+                                                            <PackagePlus size={11} />
+                                                            Add new product to catalogue
                                                         </button>
                                                     </div>
                                                     {items.length > 1 && (
                                                         <button onClick={() => setItems(p => p.filter((_, i) => i !== idx))}
-                                                            className="p-2 text-red-400 hover:bg-red-50 rounded-lg mt-0.5">
+                                                            className="p-2 text-red-400 hover:bg-red-50 rounded-lg mt-0.5 flex-shrink-0">
                                                             <X size={14} />
                                                         </button>
                                                     )}
                                                 </div>
+
+                                                {/* Inline new product form */}
                                                 {showNewProduct === idx && (
-                                                    <div className="bg-white border border-sky-200 rounded-xl p-3 space-y-2">
-                                                        <p className="text-xs font-bold text-sky-700">New Product</p>
+                                                    <div className="bg-white border-2 border-sky-200 rounded-xl p-3 space-y-2">
+                                                        <p className="text-xs font-bold text-sky-700">Quick Add Product</p>
                                                         <input value={newProduct.name}
                                                             onChange={e => setNewProduct(f => ({ ...f, name: e.target.value }))}
                                                             placeholder="Product name *"
-                                                            className="w-full border border-slate-200 rounded-lg px-2 py-2 text-sm focus:outline-none" />
+                                                            className="w-full border border-slate-200 rounded-lg px-2.5 py-2 text-sm outline-none focus:ring-2 focus:ring-sky-300" />
                                                         <div className="grid grid-cols-2 gap-2">
                                                             <select value={newProduct.category}
                                                                 onChange={e => setNewProduct(f => ({ ...f, category: e.target.value }))}
-                                                                className="border border-slate-200 rounded-lg px-2 py-2 text-sm bg-white focus:outline-none">
+                                                                className="border border-slate-200 rounded-lg px-2 py-2 text-sm bg-white outline-none">
                                                                 {CATEGORIES.map(c => <option key={c}>{c}</option>)}
                                                             </select>
                                                             <input type="number" value={newProduct.selling_price}
                                                                 onChange={e => setNewProduct(f => ({ ...f, selling_price: e.target.value }))}
                                                                 placeholder="Price (TND)"
-                                                                className="border border-slate-200 rounded-lg px-2 py-2 text-sm focus:outline-none" />
+                                                                className="border border-slate-200 rounded-lg px-2 py-2 text-sm outline-none" />
                                                         </div>
                                                         <div className="flex gap-2">
                                                             <button onClick={() => setShowNewProduct(null)}
-                                                                className="flex-1 py-2 text-xs border border-slate-200 rounded-lg">Cancel</button>
+                                                                className="flex-1 py-1.5 text-xs border border-slate-200 rounded-lg hover:bg-slate-50">
+                                                                Cancel
+                                                            </button>
                                                             <button onClick={() => createProductInline(idx)}
                                                                 disabled={savingInline || !newProduct.name.trim()}
-                                                                className="flex-1 py-2 text-xs bg-sky-500 text-white rounded-lg disabled:opacity-50">
-                                                                {savingInline ? 'Adding...' : '+ Add & Select'}
+                                                                className="flex-1 py-1.5 text-xs bg-sky-500 text-white rounded-lg hover:bg-sky-600 disabled:opacity-50 font-medium">
+                                                                {savingInline ? '...' : '+ Add & Select'}
                                                             </button>
                                                         </div>
                                                     </div>
                                                 )}
+
                                                 {!item.product_id && showNewProduct !== idx && (
                                                     <input value={item.custom_description}
                                                         onChange={e => updateItem(idx, 'custom_description', e.target.value)}
                                                         placeholder="Describe the item..."
-                                                        className="w-full border border-slate-200 rounded-lg px-2 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-sky-300" />
+                                                        className="w-full border border-slate-200 rounded-lg px-2.5 py-2 text-sm outline-none focus:ring-2 focus:ring-sky-300" />
                                                 )}
+
                                                 <div className="grid grid-cols-2 gap-2">
                                                     <div>
-                                                        <label className="text-xs text-slate-400 block mb-0.5">Qty</label>
+                                                        <label className="text-xs text-slate-400 block mb-0.5">Quantity</label>
                                                         <input type="number" min="1" value={item.quantity}
                                                             onChange={e => updateItem(idx, 'quantity', e.target.value)}
-                                                            className="w-full border border-slate-200 rounded-lg px-2 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-sky-300" />
+                                                            className="w-full border border-slate-200 rounded-lg px-2.5 py-2 text-sm outline-none focus:ring-2 focus:ring-sky-300" />
                                                     </div>
                                                     <div>
                                                         <label className="text-xs text-slate-400 block mb-0.5">Price (TND)</label>
                                                         <input type="number" value={item.unit_price}
                                                             onChange={e => updateItem(idx, 'unit_price', e.target.value)}
                                                             placeholder="0.00"
-                                                            className="w-full border border-slate-200 rounded-lg px-2 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-sky-300" />
+                                                            className="w-full border border-slate-200 rounded-lg px-2.5 py-2 text-sm outline-none focus:ring-2 focus:ring-sky-300" />
                                                     </div>
                                                 </div>
                                             </div>
                                         ))}
                                     </div>
+
                                     <button onClick={() => setItems(p => [...p, { ...emptyItem }])}
-                                        className="mt-2 w-full py-2 border-2 border-dashed border-slate-200 rounded-xl text-sm text-slate-400 hover:border-sky-300 hover:text-sky-500 transition-colors">
-                                        + Add another item
+                                        className="mt-2 w-full py-2.5 border-2 border-dashed border-slate-200 rounded-xl text-sm text-slate-400 hover:border-sky-300 hover:text-sky-500 transition-colors">
+                                        + Add item
                                     </button>
+
                                     {items.some(i => i.unit_price) && (
-                                        <div className="mt-2 bg-emerald-50 rounded-xl px-3 py-2 text-sm font-semibold text-emerald-700">
+                                        <div className="mt-2 bg-emerald-50 border border-emerald-200 rounded-xl px-3 py-2 text-sm font-bold text-emerald-700">
                                             Total: {calcTotal(items).toFixed(2)} TND
                                         </div>
                                     )}
+
+                                    <div className="bg-teal-50 border border-teal-200 rounded-xl p-3 mt-2">
+                                        <p className="text-xs text-teal-700 font-medium">
+                                            📦 Stock will be checked automatically. If unavailable, order will be placed on hold.
+                                        </p>
+                                    </div>
                                 </div>
                             )}
 
-                            <div className="grid grid-cols-2 gap-3">
-                                <div>
-                                    <label className="text-sm font-medium text-slate-700 block mb-1">Deadline</label>
-                                    <input type="date" value={form.deadline}
-                                        onChange={e => setForm(f => ({ ...f, deadline: e.target.value }))}
-                                        className="w-full border border-slate-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-sky-300" />
-                                </div>
-                                <div>
-                                    <label className="text-sm font-medium text-slate-700 block mb-1">Initial Status</label>
-                                    <select value={form.status}
-                                        onChange={e => setForm(f => ({ ...f, status: e.target.value }))}
-                                        className="w-full border border-slate-200 rounded-xl px-3 py-2.5 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-sky-300">
-                                        {STATUSES.filter(s => !['paid', 'cancelled', 'in_production', 'ready'].includes(s.key)).map(s =>
-                                            <option key={s.key} value={s.key}>{s.emoji} {s.label}</option>
-                                        )}
-                                    </select>
-                                </div>
+                            {/* Deadline */}
+                            <div>
+                                <label className="text-sm font-medium text-slate-700 block mb-1.5">Deadline</label>
+                                <input type="date" value={form.deadline}
+                                    onChange={e => setForm(f => ({ ...f, deadline: e.target.value }))}
+                                    className="w-full border-2 border-slate-200 focus:border-sky-400 rounded-xl px-3 py-2.5 text-sm outline-none transition-colors" />
                             </div>
 
+                            {/* Notes */}
                             <div>
-                                <label className="text-sm font-medium text-slate-700 block mb-1">Notes</label>
+                                <label className="text-sm font-medium text-slate-700 block mb-1.5">Internal Notes</label>
                                 <textarea value={form.notes}
                                     onChange={e => setForm(f => ({ ...f, notes: e.target.value }))}
-                                    placeholder="Internal notes..."
+                                    placeholder="Private notes, reminders..."
                                     rows={2}
-                                    className="w-full border border-slate-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-sky-300 resize-none" />
+                                    className="w-full border-2 border-slate-200 focus:border-sky-400 rounded-xl px-3 py-2.5 text-sm outline-none resize-none transition-colors" />
                             </div>
 
-                            <div className="bg-amber-50 border border-amber-200 rounded-xl p-3">
-                                <p className="text-xs text-amber-700 font-medium">
-                                    🖨️ A print job will be automatically created and linked to this order
-                                </p>
-                            </div>
+                            {/* Form error */}
+                            {error && (
+                                <div className="bg-red-50 border border-red-200 rounded-xl p-3 text-sm text-red-600 font-medium">
+                                    ⚠️ {error}
+                                </div>
+                            )}
                         </div>
 
+                        {/* Action buttons */}
                         <div className="p-5 pt-0 flex gap-3">
                             <button onClick={closeModal}
-                                className="flex-1 py-3 border border-slate-200 rounded-xl text-sm font-medium hover:bg-slate-50">Cancel</button>
-                            <button onClick={saveOrder} disabled={saving || !form.client_id}
-                                className="flex-1 py-3 bg-sky-500 hover:bg-sky-600 disabled:opacity-50 text-white rounded-xl text-sm font-medium">
-                                {saving ? 'Saving...' : 'Create Order'}
+                                className="flex-1 py-3 border border-slate-200 rounded-xl text-sm font-medium hover:bg-slate-50 transition-colors">
+                                Cancel
+                            </button>
+                            <button onClick={saveOrder}
+                                disabled={saving || !form.client_id || (form.type === 'custom' && !form.custom_description.trim())}
+                                className="flex-1 py-3 bg-sky-500 hover:bg-sky-600 disabled:opacity-50 text-white rounded-xl text-sm font-semibold transition-colors">
+                                {saving ? 'Creating...' : 'Create Order'}
                             </button>
                         </div>
                     </div>
                 </div>
             )}
 
-            {/* ORDER DETAIL */}
+            {/* ══════════════════════════════════════════════════════
+          ORDER DETAIL PANEL
+      ══════════════════════════════════════════════════════ */}
             {selected && (
-                <div className="fixed inset-0 bg-black/40 z-50 flex items-end sm:items-center justify-center p-0 sm:p-4">
-                    <div className="bg-white w-full sm:max-w-lg rounded-t-3xl sm:rounded-2xl shadow-2xl max-h-[92vh] overflow-y-auto">
+                <div className="fixed inset-0 bg-black/50 z-50 flex items-end sm:items-center justify-center p-0 sm:p-4">
+                    <div className="bg-white w-full sm:max-w-lg rounded-t-3xl sm:rounded-2xl shadow-2xl
+            max-h-[85vh] sm:max-h-[92vh] overflow-y-auto mb-16 sm:mb-0">
+
                         <div className="flex items-center justify-between p-5 border-b sticky top-0 bg-white rounded-t-3xl z-10">
                             <div>
                                 <h2 className="text-lg font-bold text-slate-800">{selected.clients?.name}</h2>
-                                <div className="flex items-center gap-2 mt-0.5 flex-wrap">
+                                <div className="flex items-center gap-1.5 mt-0.5 flex-wrap">
                                     <span className={`text-xs font-semibold px-2 py-0.5 rounded-full ${si(selected.status).color}`}>
                                         {si(selected.status).emoji} {si(selected.status).label}
                                     </span>
@@ -676,122 +995,187 @@ export default function Orders() {
                                     </span>
                                 </div>
                             </div>
-                            <div className="flex gap-2">
+                            <div className="flex gap-1">
                                 <button onClick={() => setDeleting(selected)}
-                                    className="p-2 text-slate-400 hover:text-red-500 hover:bg-red-50 rounded-xl">
+                                    className="p-2 text-slate-400 hover:text-red-500 hover:bg-red-50 rounded-xl transition-colors">
                                     <Trash2 size={16} />
                                 </button>
-                                <button onClick={() => setSelected(null)} className="p-2 hover:bg-slate-100 rounded-xl">
+                                <button onClick={closeDetail} className="p-2 hover:bg-slate-100 rounded-xl transition-colors">
                                     <X size={20} />
                                 </button>
                             </div>
                         </div>
 
                         <div className="p-5 space-y-4">
-                            {nextLabel(selected) && (
-                                <button onClick={() => advanceStatus(selected)}
-                                    className="w-full py-3.5 bg-sky-500 hover:bg-sky-600 text-white rounded-xl font-semibold text-sm flex items-center justify-center gap-2 transition-colors">
-                                    <ArrowRight size={16} /> Mark as {nextLabel(selected)}
-                                </button>
-                            )}
-                            {selected.status === 'paid' && (
-                                <div className="w-full py-3 bg-emerald-100 text-emerald-700 rounded-xl font-semibold text-sm text-center">
-                                    ✅ Order Complete & Paid
-                                </div>
-                            )}
 
+                            {/* ── PRIMARY ACTION BUTTON ── */}
+                            {(() => {
+                                const next = getNextStatus(selected)
+                                const nextSI = next ? si(next) : null
+                                if (selected.status === 'paid') return (
+                                    <div className="w-full py-3.5 bg-emerald-50 border border-emerald-200 text-emerald-700 rounded-xl font-bold text-sm text-center">
+                                        ✅ Order Complete
+                                    </div>
+                                )
+                                if (selected.status === 'cancelled') return (
+                                    <div className="w-full py-3.5 bg-red-50 border border-red-200 text-red-600 rounded-xl font-bold text-sm text-center">
+                                        ❌ Cancelled
+                                    </div>
+                                )
+                                if (selected.status === 'waiting_restock') return (
+                                    <div className="space-y-2">
+                                        <div className="bg-pink-50 border border-pink-200 rounded-xl p-3">
+                                            <p className="text-sm font-bold text-pink-700">⏸️ Waiting for restock</p>
+                                            <p className="text-xs text-pink-500 mt-0.5">
+                                                Product was out of stock when ordered. Add stock in the Stock page, then mark ready.
+                                            </p>
+                                        </div>
+                                        <button onClick={() => applyStatusChange(selected, 'ready')} disabled={saving}
+                                            className="w-full py-3 bg-pink-500 hover:bg-pink-600 text-white rounded-xl font-semibold text-sm disabled:opacity-50 transition-colors">
+                                            ✅ Stock available → Mark Ready
+                                        </button>
+                                    </div>
+                                )
+                                if (!next) return null
+                                return (
+                                    <button onClick={() => applyStatusChange(selected, next)} disabled={saving}
+                                        className="w-full py-3.5 bg-sky-500 hover:bg-sky-600 text-white rounded-xl font-bold text-sm flex items-center justify-center gap-2 disabled:opacity-50 transition-colors shadow-sm">
+                                        <ArrowRight size={16} /> Mark as {nextSI?.label}
+                                    </button>
+                                )
+                            })()}
+
+                            {/* ── PIPELINE STEPPER ── */}
                             <div className="bg-slate-50 rounded-xl p-3">
-                                <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">Pipeline</p>
-                                <div className="flex gap-1.5 flex-wrap">
-                                    {FLOW.map(key => {
-                                        const currentIdx = FLOW.indexOf(selected.status)
-                                        const thisIdx = FLOW.indexOf(key)
+                                <p className="text-xs font-bold text-slate-400 uppercase tracking-wider mb-3">
+                                    {selected.type === 'custom' ? 'Custom Order Pipeline' : 'Standard Order Pipeline'}
+                                </p>
+                                <div className="space-y-2">
+                                    {getFlow(selected.type).map((key, idx) => {
+                                        const currentIdx = getFlow(selected.type).indexOf(selected.status)
                                         const s = si(key)
+                                        const isDone = idx < currentIdx
+                                        const isCurrent = idx === currentIdx
+                                        const isFuture = idx > currentIdx
                                         return (
-                                            <button key={key} onClick={() => setStatus(selected.id, key)}
-                                                className={`text-xs px-2.5 py-1.5 rounded-lg font-medium transition-all
-                          ${thisIdx === currentIdx ? s.color + ' ring-2 ring-offset-1' :
-                                                        thisIdx < currentIdx ? 'bg-slate-200 text-slate-400' :
-                                                            'bg-white border border-slate-200 text-slate-400 hover:bg-slate-100'}`}>
-                                                {s.emoji} {s.label}
-                                            </button>
+                                            <div key={key} className="flex items-center gap-3">
+                                                <div className={`w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold flex-shrink-0 transition-colors
+                          ${isCurrent ? s.dot + ' text-white' : isDone ? 'bg-emerald-100 text-emerald-600' : 'bg-slate-200 text-slate-400'}`}>
+                                                    {isDone ? '✓' : isCurrent ? s.emoji : idx + 1}
+                                                </div>
+                                                <span className={`flex-1 text-sm transition-colors
+                          ${isCurrent ? 'font-bold text-slate-800' : isDone ? 'text-slate-400 line-through' : 'text-slate-400'}`}>
+                                                    {s.label}
+                                                </span>
+                                                {isCurrent && (
+                                                    <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${s.color}`}>
+                                                        Current
+                                                    </span>
+                                                )}
+                                                {isFuture && !TERMINAL.includes(key) && (
+                                                    <button onClick={() => applyStatusChange(selected, key)} disabled={saving}
+                                                        className="text-xs px-2 py-1 bg-white border border-slate-200 text-slate-400 hover:border-sky-300 hover:text-sky-500 rounded-lg transition-colors">
+                                                        Set
+                                                    </button>
+                                                )}
+                                            </div>
                                         )
                                     })}
-                                    <button onClick={() => setStatus(selected.id, 'cancelled')}
-                                        className={`text-xs px-2.5 py-1.5 rounded-lg font-medium
-                      ${selected.status === 'cancelled' ? 'bg-red-100 text-red-600' : 'bg-white border border-slate-200 text-slate-400 hover:bg-red-50'}`}>
-                                        ❌ Cancel
-                                    </button>
                                 </div>
+
+                                {/* Cancel button */}
+                                {!TERMINAL.includes(selected.status) && (
+                                    <button onClick={() => applyStatusChange(selected, 'cancelled')} disabled={saving}
+                                        className="mt-3 w-full py-2 text-xs font-medium text-red-400 hover:text-red-600 hover:bg-red-50 rounded-xl transition-colors border border-transparent hover:border-red-200">
+                                        ❌ Cancel this order
+                                    </button>
+                                )}
                             </div>
 
+                            {/* ── ORDER INFO ── */}
                             <div className="grid grid-cols-2 gap-3">
                                 <div className="bg-slate-50 rounded-xl p-3">
                                     <p className="text-xs text-slate-400 mb-1">Price</p>
                                     <p className="font-bold text-slate-800 text-lg">
-                                        {selected.total_price ? `${selected.total_price} TND` : <span className="text-slate-400 text-sm font-normal">Not set</span>}
+                                        {selected.total_price
+                                            ? `${parseFloat(selected.total_price).toFixed(2)} TND`
+                                            : <span className="text-slate-400 text-sm font-normal">Not set</span>}
                                     </p>
                                 </div>
                                 <div className="bg-slate-50 rounded-xl p-3">
                                     <p className="text-xs text-slate-400 mb-1">Deadline</p>
                                     <p className={`font-semibold text-sm ${isOverdue(selected) ? 'text-red-500' : 'text-slate-800'}`}>
-                                        {selected.deadline ? fmt(selected.deadline) : '—'}
+                                        {selected.deadline ? fmt(selected.deadline) : 'No deadline'}
                                     </p>
                                 </div>
                             </div>
 
+                            {/* Custom details */}
                             {selected.type === 'custom' && selected.custom_description && (
                                 <div className="bg-violet-50 border border-violet-100 rounded-xl p-3">
-                                    <p className="text-xs font-semibold text-violet-500 mb-1">What they want</p>
+                                    <p className="text-xs font-bold text-violet-500 mb-1.5">📋 Request Details</p>
                                     <p className="text-sm text-slate-700">{selected.custom_description}</p>
-                                    {selected.dimensions && <p className="text-xs text-slate-500 mt-1">📐 {selected.dimensions}</p>}
+                                    {selected.dimensions && (
+                                        <p className="text-xs text-slate-500 mt-1.5 font-medium">📐 {selected.dimensions}</p>
+                                    )}
                                 </div>
                             )}
 
                             {selected.reference_notes && (
                                 <div className="bg-amber-50 border border-amber-100 rounded-xl p-3">
-                                    <p className="text-xs font-semibold text-amber-600 mb-1">Reference / Instructions</p>
+                                    <p className="text-xs font-bold text-amber-600 mb-1">🗒️ Reference / Instructions</p>
                                     <p className="text-sm text-slate-700">{selected.reference_notes}</p>
                                 </div>
                             )}
 
-                            {selected.order_items?.length > 0 && (
+                            {/* Standard items */}
+                            {(selected.order_items || []).length > 0 && (
                                 <div>
-                                    <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">Items</p>
+                                    <p className="text-xs font-bold text-slate-400 uppercase tracking-wider mb-2">Items</p>
                                     <div className="space-y-2">
                                         {selected.order_items.map(item => (
-                                            <div key={item.id} className="flex justify-between items-center bg-slate-50 rounded-xl px-3 py-2.5">
+                                            <div key={item.id} className="flex items-center justify-between bg-slate-50 rounded-xl px-3 py-2.5">
                                                 <div>
                                                     <p className="text-sm font-medium text-slate-700">
                                                         {item.products?.name || item.custom_description || 'Item'}
                                                     </p>
                                                     <p className="text-xs text-slate-400">×{item.quantity}</p>
                                                 </div>
-                                                <p className="font-semibold text-slate-700 text-sm">
-                                                    {item.unit_price ? `${(item.unit_price * item.quantity).toFixed(2)} TND` : '—'}
+                                                <p className="text-sm font-bold text-slate-700">
+                                                    {item.unit_price
+                                                        ? `${(parseFloat(item.unit_price) * parseInt(item.quantity)).toFixed(2)} TND`
+                                                        : '—'}
                                                 </p>
                                             </div>
                                         ))}
+                                        {selected.total_price && (
+                                            <div className="flex justify-between px-3 py-2 font-bold text-sm text-slate-800">
+                                                <span>Total</span>
+                                                <span>{parseFloat(selected.total_price).toFixed(2)} TND</span>
+                                            </div>
+                                        )}
                                     </div>
                                 </div>
                             )}
 
+                            {/* Notes */}
                             {selected.notes && (
                                 <div className="bg-slate-50 rounded-xl p-3">
-                                    <p className="text-xs font-semibold text-slate-400 mb-1">Notes</p>
+                                    <p className="text-xs font-bold text-slate-400 mb-1">Notes</p>
                                     <p className="text-sm text-slate-600">{selected.notes}</p>
                                 </div>
                             )}
 
+                            {/* Contact buttons */}
                             {selected.clients?.phone && (
                                 <div className="grid grid-cols-2 gap-2">
-                                    <a href={`https://wa.me/${selected.clients.phone.replace(/\s+/g, '')}`}
+                                    <a href={`https://wa.me/${selected.clients.phone.replace(/[\s+\-()]/g, '')}`}
                                         target="_blank" rel="noreferrer"
-                                        className="flex items-center justify-center gap-2 py-3 bg-emerald-500 hover:bg-emerald-600 text-white rounded-xl text-sm font-medium">
+                                        className="flex items-center justify-center gap-2 py-3 bg-emerald-500 hover:bg-emerald-600 text-white rounded-xl text-sm font-semibold transition-colors">
                                         💬 WhatsApp
                                     </a>
                                     <a href={`tel:${selected.clients.phone}`}
-                                        className="flex items-center justify-center gap-2 py-3 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl text-sm font-medium">
+                                        className="flex items-center justify-center gap-2 py-3 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl text-sm font-semibold transition-colors">
                                         <Phone size={15} /> Call
                                     </a>
                                 </div>
@@ -801,19 +1185,26 @@ export default function Orders() {
                 </div>
             )}
 
+            {/* ── DELETE CONFIRM ── */}
             {deleting && (
                 <div className="fixed inset-0 bg-black/60 z-[60] flex items-center justify-center p-4">
                     <div className="bg-white rounded-2xl shadow-2xl p-6 max-w-sm w-full">
-                        <h3 className="font-bold text-slate-800 text-lg mb-1">Delete order?</h3>
-                        <p className="text-slate-500 text-sm mb-2">
-                            Order for <span className="font-medium">{deleting.clients?.name}</span> will be deleted.
+                        <h3 className="font-bold text-slate-800 text-lg mb-1">Delete this order?</h3>
+                        <p className="text-slate-500 text-sm mb-1">
+                            Order for <span className="font-semibold">{deleting.clients?.name}</span> will be permanently deleted.
                         </p>
-                        <p className="text-xs text-red-500 mb-5">⚠️ All linked print jobs will also be deleted.</p>
+                        {deleting.type === 'custom' && (
+                            <p className="text-xs text-red-500 mb-5">⚠️ All linked print jobs will also be deleted.</p>
+                        )}
                         <div className="flex gap-3">
                             <button onClick={() => setDeleting(null)}
-                                className="flex-1 py-2.5 border border-slate-200 rounded-xl text-sm font-medium hover:bg-slate-50">Cancel</button>
+                                className="flex-1 py-2.5 border border-slate-200 rounded-xl text-sm font-medium hover:bg-slate-50">
+                                Keep it
+                            </button>
                             <button onClick={() => deleteOrder(deleting.id)}
-                                className="flex-1 py-2.5 bg-red-500 hover:bg-red-600 text-white rounded-xl text-sm font-medium">Delete</button>
+                                className="flex-1 py-2.5 bg-red-500 hover:bg-red-600 text-white rounded-xl text-sm font-semibold">
+                                Delete
+                            </button>
                         </div>
                     </div>
                 </div>

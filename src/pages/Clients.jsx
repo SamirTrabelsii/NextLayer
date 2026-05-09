@@ -259,7 +259,7 @@ export default function Clients() {
             {/* Modal */}
             {showModal && (
                 <div className="fixed inset-0 bg-black/40 z-50 flex items-end sm:items-center justify-center p-0 sm:p-4">
-                    <div className="bg-white w-full sm:max-w-md rounded-t-3xl sm:rounded-2xl shadow-2xl max-h-[92vh] overflow-y-auto">
+                    <div className="bg-white w-full sm:max-w-md rounded-t-3xl sm:rounded-2xl shadow-2xl max-h-[85vh] sm:max-h-[92vh] overflow-y-auto mb-16 sm:mb-0">
                         <div className="flex items-center justify-between p-5 border-b sticky top-0 bg-white rounded-t-3xl">
                             <h2 className="text-lg font-bold text-slate-800">{editing ? 'Edit Client' : 'New Client'}</h2>
                             <button onClick={closeModal} className="p-2 hover:bg-slate-100 rounded-xl"><X size={20} /></button>

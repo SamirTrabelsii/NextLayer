@@ -4,6 +4,8 @@ import { Plus, Pencil, Trash2, Search, X, Package } from 'lucide-react'
 
 const CATEGORIES = ['All', 'Keychains', 'Clickers', 'Decorations', 'Custom Orders']
 const MATERIALS = ['PLA', 'PETG', 'ABS', 'TPU', 'Resin', 'Other']
+const FILAMENT_PRICE_PER_KG = 35
+const ELECTRICITY_PER_HOUR = 0.15
 
 const empty = {
     name: '', category: 'Keychains', material: 'PLA', color: '',
@@ -21,28 +23,38 @@ export default function Products() {
     const [editing, setEditing] = useState(null)
     const [deleting, setDeleting] = useState(null)
     const [saving, setSaving] = useState(false)
+    const [materials, setMaterials] = useState([])
+    const [productMaterials, setProductMaterials] = useState([]) // BOM for current product
+    const [bomItem, setBomItem] = useState({ material_id: '', quantity_per_unit: 1 })
 
     useEffect(() => { fetchProducts() }, [])
 
     async function fetchProducts() {
         setLoading(true)
-        const { data } = await supabase
-            .from('products')
-            .select('*')
-            .order('created_at', { ascending: false })
+        const [{ data }, { data: mats }] = await Promise.all([
+            supabase.from('products').select('*').order('created_at', { ascending: false }),
+            supabase.from('materials').select('id, name, category, unit, cost_per_unit').order('name'),
+        ])
         setProducts(data || [])
+        setMaterials(mats || [])
         setLoading(false)
+    }
+    async function openEdit(p) {
+        setForm({ ...p })
+        setEditing(p.id)
+        // Load existing BOM
+        const { data: bom } = await supabase
+            .from('product_materials')
+            .select('*, materials(name, unit, cost_per_unit)')
+            .eq('product_id', p.id)
+        setProductMaterials(bom || [])
+        setShowModal(true)
     }
 
     function openAdd() {
         setForm(empty)
         setEditing(null)
-        setShowModal(true)
-    }
-
-    function openEdit(p) {
-        setForm({ ...p })
-        setEditing(p.id)
+        setProductMaterials([])
         setShowModal(true)
     }
 
@@ -52,19 +64,44 @@ export default function Products() {
         setEditing(null)
     }
 
+    function calcProductCost(formData, bom) {
+        const grams = parseFloat(formData.filament_grams) || 0
+        const hours = parseFloat(formData.print_time_hours) || 0
+        const filamentCost = (grams / 1000) * FILAMENT_PRICE_PER_KG
+        const electricityCost = hours * ELECTRICITY_PER_HOUR
+        const materialsCost = bom.reduce((s, b) =>
+            s + ((b.quantity_per_unit || 1) * (b.materials?.cost_per_unit || 0)), 0)
+        return (filamentCost + electricityCost + materialsCost).toFixed(2)
+    }
+
     // Auto-calculate production cost when filament or time changes
     function handleChange(e) {
         const { name, value, type, checked } = e.target
         const updated = { ...form, [name]: type === 'checkbox' ? checked : value }
-
-        if (name === 'filament_grams' || name === 'print_time_hours') {
-            const grams = parseFloat(name === 'filament_grams' ? value : form.filament_grams) || 0
-            const hours = parseFloat(name === 'print_time_hours' ? value : form.print_time_hours) || 0
-            // Estimate: filament ~0.02 TND/g + electricity ~0.15 TND/hr
-            updated.production_cost = ((grams * 0.02) + (hours * 0.15)).toFixed(2)
+        if (['filament_grams', 'print_time_hours'].includes(name)) {
+            updated.production_cost = calcProductCost(updated, productMaterials)
         }
-
         setForm(updated)
+    }
+
+    async function addBomItem() {
+        if (!bomItem.material_id) return
+        const mat = materials.find(m => m.id === bomItem.material_id)
+        const newItem = {
+            material_id: bomItem.material_id,
+            quantity_per_unit: parseInt(bomItem.quantity_per_unit) || 1,
+            materials: mat,
+        }
+        const newBom = [...productMaterials, newItem]
+        setProductMaterials(newBom)
+        setBomItem({ material_id: '', quantity_per_unit: 1 })
+        setForm(f => ({ ...f, production_cost: calcProductCost(f, newBom) }))
+    }
+
+    function removeBomItem(idx) {
+        const newBom = productMaterials.filter((_, i) => i !== idx)
+        setProductMaterials(newBom)
+        setForm(f => ({ ...f, production_cost: calcProductCost(f, newBom) }))
     }
 
     async function saveProduct() {
@@ -77,14 +114,29 @@ export default function Products() {
             production_cost: parseFloat(form.production_cost) || null,
             selling_price: parseFloat(form.selling_price) || null,
         }
+        let productId = editing
         if (editing) {
             await supabase.from('products').update(payload).eq('id', editing)
         } else {
-            await supabase.from('products').insert([payload])
+            const { data } = await supabase.from('products').insert([payload]).select().single()
+            productId = data?.id
         }
-        setSaving(false)
-        closeModal()
-        fetchProducts()
+
+        // Save BOM
+        if (productId) {
+            await supabase.from('product_materials').delete().eq('product_id', productId)
+            if (productMaterials.length > 0) {
+                await supabase.from('product_materials').insert(
+                    productMaterials.map(b => ({
+                        product_id: productId,
+                        material_id: b.material_id,
+                        quantity_per_unit: b.quantity_per_unit,
+                    }))
+                )
+            }
+        }
+
+        setSaving(false); closeModal(); fetchProducts()
     }
 
     async function deleteProduct(id) {
@@ -297,6 +349,63 @@ export default function Products() {
                                     <input name="selling_price" type="number" value={form.selling_price} onChange={handleChange}
                                         placeholder="0.00"
                                         className="w-full border border-slate-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-sky-300" />
+                                </div>
+                            </div>
+
+                            {/* Bill of Materials */}
+                            <div>
+                                <label className="text-sm font-medium text-slate-700 block mb-2">
+                                    🔩 Components (Bill of Materials)
+                                    <span className="text-xs text-slate-400 font-normal ml-1">
+                                        — materials consumed per unit produced
+                                    </span>
+                                </label>
+
+                                {productMaterials.length > 0 && (
+                                    <div className="mb-2 space-y-1.5">
+                                        {productMaterials.map((b, idx) => (
+                                            <div key={idx} className="flex items-center justify-between bg-slate-50 rounded-xl px-3 py-2">
+                                                <div className="flex items-center gap-2">
+                                                    <span className="text-sm font-medium text-slate-700">{b.materials?.name}</span>
+                                                    <span className="text-xs text-slate-400">× {b.quantity_per_unit} {b.materials?.unit}</span>
+                                                </div>
+                                                <div className="flex items-center gap-2">
+                                                    {b.materials?.cost_per_unit > 0 && (
+                                                        <span className="text-xs text-sky-600 font-medium">
+                                                            {(b.quantity_per_unit * b.materials.cost_per_unit).toFixed(2)} TND
+                                                        </span>
+                                                    )}
+                                                    <button onClick={() => removeBomItem(idx)}
+                                                        className="p-1 text-red-400 hover:text-red-600">
+                                                        <X size={14} />
+                                                    </button>
+                                                </div>
+                                            </div>
+                                        ))}
+                                        <div className="text-xs text-right text-slate-500 pr-2">
+                                            Materials total: {productMaterials.reduce((s, b) =>
+                                                s + ((b.quantity_per_unit || 1) * (b.materials?.cost_per_unit || 0)), 0).toFixed(2)} TND
+                                        </div>
+                                    </div>
+                                )}
+
+                                <div className="flex gap-2">
+                                    <select value={bomItem.material_id}
+                                        onChange={e => setBomItem(f => ({ ...f, material_id: e.target.value }))}
+                                        className="flex-1 border border-slate-200 rounded-xl px-3 py-2 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-sky-300">
+                                        <option value="">Add a material...</option>
+                                        {materials.filter(m => !productMaterials.find(b => b.material_id === m.id)).map(m => (
+                                            <option key={m.id} value={m.id}>{m.name} ({m.unit})</option>
+                                        ))}
+                                    </select>
+                                    <input type="number" min="1" value={bomItem.quantity_per_unit}
+                                        onChange={e => setBomItem(f => ({ ...f, quantity_per_unit: e.target.value }))}
+                                        className="w-16 border border-slate-200 rounded-xl px-2 py-2 text-sm text-center focus:outline-none focus:ring-2 focus:ring-sky-300"
+                                        placeholder="Qty" />
+                                    <button onClick={addBomItem} disabled={!bomItem.material_id}
+                                        className="px-3 py-2 bg-sky-500 hover:bg-sky-600 disabled:opacity-40 text-white rounded-xl text-sm font-medium">
+                                        Add
+                                    </button>
                                 </div>
                             </div>
 
