@@ -37,22 +37,43 @@ export default function Reseller() {
 
     async function saveConsignment() {
         if (!form.reseller_id || !form.product_id || !form.quantity_given) return
+
+        // ── CHECK STOCK AVAILABILITY ──
+        const qty = parseInt(form.quantity_given)
+        const { data: stockItem } = await supabase
+            .from('stock').select('*').eq('product_id', form.product_id).single()
+
+        const available = stockItem?.quantity_available || 0
+        if (available < qty) {
+            alert(`❌ Not enough stock.\nAvailable: ${available} units\nRequested: ${qty} units\n\nProduce more before giving to reseller.`)
+            return
+        }
+
         setSaving(true)
+
+        // Save consignment
         await supabase.from('reseller_consignments').insert([{
             ...form,
-            quantity_given: parseInt(form.quantity_given),
+            quantity_given: qty,
             unit_price: parseFloat(form.unit_price) || null,
         }])
 
-        // Update stock: given_to_reseller
-        const { data: existing } = await supabase.from('stock').select('*').eq('product_id', form.product_id).single()
-        if (existing) {
-            await supabase.from('stock').update({
-                quantity_available: Math.max(0, (existing.quantity_available || 0) - parseInt(form.quantity_given)),
-                quantity_with_reseller: (existing.quantity_with_reseller || 0) + parseInt(form.quantity_given),
-                updated_at: new Date().toISOString(),
-            }).eq('product_id', form.product_id)
-        }
+        // ── REDUCE STOCK automatically ──
+        await supabase.from('stock').update({
+            quantity_available: Math.max(0, available - qty),
+            quantity_with_reseller: (stockItem?.quantity_with_reseller || 0) + qty,
+            updated_at: new Date().toISOString(),
+        }).eq('product_id', form.product_id)
+
+        // Log movement
+        await supabase.from('stock_movements').insert([{
+            product_id: form.product_id,
+            type: 'given_to_reseller',
+            quantity: qty,
+            is_positive: false,
+            client_id: form.reseller_id,
+            notes: `Given to reseller`,
+        }])
 
         setSaving(false)
         setShowModal(false)
@@ -86,12 +107,21 @@ export default function Reseller() {
     async function reportReturn(consignment, qtyReturned) {
         if (!qtyReturned || qtyReturned <= 0) return
         setSaving(true)
-        const qty = Math.min(parseInt(qtyReturned), consignment.quantity_given - consignment.quantity_sold - consignment.quantity_returned)
+
+        const qty = Math.min(
+            parseInt(qtyReturned),
+            consignment.quantity_given - consignment.quantity_sold - consignment.quantity_returned
+        )
+
+        // Update consignment
         await supabase.from('reseller_consignments').update({
             quantity_returned: consignment.quantity_returned + qty,
         }).eq('id', consignment.id)
 
-        const { data: existing } = await supabase.from('stock').select('*').eq('product_id', consignment.product_id).single()
+        // ── INCREASE STOCK automatically ──
+        const { data: existing } = await supabase
+            .from('stock').select('*').eq('product_id', consignment.product_id).single()
+
         if (existing) {
             await supabase.from('stock').update({
                 quantity_available: (existing.quantity_available || 0) + qty,
@@ -99,6 +129,16 @@ export default function Reseller() {
                 updated_at: new Date().toISOString(),
             }).eq('product_id', consignment.product_id)
         }
+
+        // Log movement
+        await supabase.from('stock_movements').insert([{
+            product_id: consignment.product_id,
+            type: 'returned_from_reseller',
+            quantity: qty,
+            is_positive: true,
+            client_id: consignment.reseller_id,
+            notes: `Returned from reseller`,
+        }])
 
         setSaving(false)
         fetchAll()

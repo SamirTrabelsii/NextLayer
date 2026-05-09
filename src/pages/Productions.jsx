@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react'
 import { supabase } from '../lib/supabase'
-import { Plus, X, Trash2, Printer, Clock, Zap, ChevronRight } from 'lucide-react'
+import { Plus, X, Trash2, Printer, Clock, Zap, PackagePlus } from 'lucide-react'
 
 const STATUSES = [
     { key: 'queued', label: 'Queued', emoji: '⏳', color: 'bg-slate-100 text-slate-600' },
@@ -8,17 +8,19 @@ const STATUSES = [
     { key: 'done', label: 'Done', emoji: '✅', color: 'bg-emerald-100 text-emerald-700' },
     { key: 'failed', label: 'Failed', emoji: '❌', color: 'bg-red-100 text-red-600' },
 ]
-
 const MATERIALS = ['PLA', 'PETG', 'ABS', 'TPU', 'Resin', 'Other']
+const CATEGORIES = ['Keychains', 'Clickers', 'Decorations', 'Custom Orders']
 
-const FILAMENT_PRICE_PER_KG = 35 // TND — adjust to your real price
-const ELECTRICITY_PER_HOUR = 0.15 // TND — adjust to your rate
+const FILAMENT_PRICE_PER_KG = 35
+const ELECTRICITY_PER_HOUR = 0.15
 
 const empty = {
-    order_id: '', product_id: '', description: '',
+    order_id: '', product_id: '', description: '', quantity: 1,
     material: 'PLA', color: '', filament_grams: '',
     print_time_hours: '', actual_cost: '', status: 'queued', notes: '',
 }
+
+const emptyProduct = { name: '', category: 'Custom Orders', selling_price: '', production_cost: '' }
 
 export default function Productions() {
     const [productions, setProductions] = useState([])
@@ -31,6 +33,10 @@ export default function Productions() {
     const [deleting, setDeleting] = useState(null)
     const [saving, setSaving] = useState(false)
     const [filterStatus, setFilter] = useState('active')
+    const [showNewProduct, setShowNewProduct] = useState(false)
+    const [newProduct, setNewProduct] = useState(emptyProduct)
+    const [savingProduct, setSavingProduct] = useState(false)
+    const [stockError, setStockError] = useState('')
 
     useEffect(() => { fetchAll() }, [])
 
@@ -38,14 +44,14 @@ export default function Productions() {
         setLoading(true)
         const [{ data: pr }, { data: or }, { data: pd }] = await Promise.all([
             supabase.from('productions').select(`
-        *, orders(id, custom_description, type, clients(name)),
-        products(name)
+        *, orders(id, custom_description, type, status, clients(name)),
+        products(name, id)
       `).order('created_at', { ascending: false }),
             supabase.from('orders')
                 .select('id, custom_description, type, status, clients(name)')
                 .not('status', 'in', '("paid","cancelled","delivered")')
                 .order('created_at', { ascending: false }),
-            supabase.from('products').select('id, name').eq('is_active', true).order('name'),
+            supabase.from('products').select('id,name,selling_price,category').eq('is_active', true).order('name'),
         ])
         setProductions(pr || [])
         setOrders(or || [])
@@ -54,31 +60,77 @@ export default function Productions() {
     }
 
     function openAdd() { setForm(empty); setEditing(null); setShowModal(true) }
-    function openEdit(p) { setForm({ ...p, order_id: p.order_id || '', product_id: p.product_id || '' }); setEditing(p.id); setShowModal(true) }
-    function closeModal() { setShowModal(false); setForm(empty); setEditing(null) }
+    function openEdit(p) {
+        setForm({
+            order_id: p.order_id || '', product_id: p.product_id || '',
+            description: p.description || '', quantity: p.quantity || 1,
+            material: p.material || 'PLA', color: p.color || '',
+            filament_grams: p.filament_grams || '', print_time_hours: p.print_time_hours || '',
+            actual_cost: p.actual_cost || '', status: p.status, notes: p.notes || '',
+        })
+        setEditing(p.id); setShowModal(true)
+    }
+    function closeModal() { setShowModal(false); setForm(empty); setEditing(null); setShowNewProduct(false) }
 
     function handleChange(e) {
         const { name, value } = e.target
         const updated = { ...form, [name]: value }
-
-        // Auto-calculate cost
-        if (name === 'filament_grams' || name === 'print_time_hours' || name === 'material') {
+        if (name === 'filament_grams' || name === 'print_time_hours') {
             const grams = parseFloat(name === 'filament_grams' ? value : updated.filament_grams) || 0
             const hours = parseFloat(name === 'print_time_hours' ? value : updated.print_time_hours) || 0
-            const filamentCost = (grams / 1000) * FILAMENT_PRICE_PER_KG
-            const electricityCost = hours * ELECTRICITY_PER_HOUR
-            updated.actual_cost = (filamentCost + electricityCost).toFixed(2)
+            updated.actual_cost = ((grams / 1000 * FILAMENT_PRICE_PER_KG) + (hours * ELECTRICITY_PER_HOUR)).toFixed(2)
         }
-
-        // Auto-fill description from order
-        if (name === 'order_id' && value) {
+        if (name === 'order_id' && value && !updated.description) {
             const order = orders.find(o => o.id === value)
-            if (order && !updated.description) {
-                updated.description = order.custom_description || ''
-            }
+            if (order) updated.description = order.custom_description || ''
+        }
+        setForm(updated)
+    }
+
+    async function createProductInline() {
+        if (!newProduct.name.trim()) return
+        setSavingProduct(true)
+        const { data } = await supabase.from('products').insert([{
+            ...newProduct,
+            selling_price: parseFloat(newProduct.selling_price) || null,
+            production_cost: parseFloat(newProduct.production_cost) || null,
+            is_active: true,
+        }]).select().single()
+        if (data) {
+            await fetchAll()
+            setForm(f => ({ ...f, product_id: data.id }))
+        }
+        setNewProduct(emptyProduct); setShowNewProduct(false); setSavingProduct(false)
+    }
+
+    // ── ADD TO STOCK when production done without order ──
+    async function addToStock(prod) {
+        if (!prod.product_id) return
+        const qty = parseInt(prod.quantity) || 1
+        const { data: existing, error } = await supabase
+            .from('stock').select('*').eq('product_id', prod.product_id).single()
+
+        if (existing) {
+            await supabase.from('stock').update({
+                quantity_available: (existing.quantity_available || 0) + qty,
+                updated_at: new Date().toISOString(),
+            }).eq('product_id', prod.product_id)
+        } else {
+            await supabase.from('stock').insert([{
+                product_id: prod.product_id,
+                quantity_available: qty,
+                quantity_with_reseller: 0,
+            }])
         }
 
-        setForm(updated)
+        // Log movement
+        await supabase.from('stock_movements').insert([{
+            product_id: prod.product_id,
+            type: 'produced',
+            quantity: qty,
+            is_positive: true,
+            notes: `Production completed — ${prod.products?.name || prod.description}`,
+        }])
     }
 
     async function saveProd() {
@@ -88,6 +140,7 @@ export default function Productions() {
             ...form,
             order_id: form.order_id || null,
             product_id: form.product_id || null,
+            quantity: parseInt(form.quantity) || 1,
             filament_grams: parseFloat(form.filament_grams) || null,
             print_time_hours: parseFloat(form.print_time_hours) || null,
             actual_cost: parseFloat(form.actual_cost) || null,
@@ -97,20 +150,43 @@ export default function Productions() {
         } else {
             await supabase.from('productions').insert([payload])
         }
-        setSaving(false)
-        closeModal()
-        fetchAll()
+        setSaving(false); closeModal(); fetchAll()
     }
 
     async function updateStatus(id, status) {
         await supabase.from('productions').update({ status }).eq('id', id)
+
+        const prod = productions.find(p => p.id === id)
+
+        if (status === 'done' && prod) {
+            if (prod.order_id) {
+                // Has order → advance order to 'ready' if it's 'in_production'
+                const { data: order } = await supabase.from('orders')
+                    .select('status').eq('id', prod.order_id).single()
+                if (order?.status === 'in_production') {
+                    await supabase.from('orders').update({ status: 'ready' }).eq('id', prod.order_id)
+                }
+            } else if (prod.product_id) {
+                // No order → add to stock automatically
+                await addToStock({ ...prod, status: 'done' })
+            }
+        }
+
+        if (status === 'printing' && prod?.order_id) {
+            // Sync order to in_production
+            const { data: order } = await supabase.from('orders')
+                .select('status').eq('id', prod.order_id).single()
+            if (order && ['confirmed', 'quoted'].includes(order.status)) {
+                await supabase.from('orders').update({ status: 'in_production' }).eq('id', prod.order_id)
+            }
+        }
+
         fetchAll()
     }
 
     async function deleteProd(id) {
         await supabase.from('productions').delete().eq('id', id)
-        setDeleting(null)
-        fetchAll()
+        setDeleting(null); fetchAll()
     }
 
     const filtered = productions.filter(p => {
@@ -119,23 +195,16 @@ export default function Productions() {
         return true
     })
 
-    // Stats
     const queued = productions.filter(p => p.status === 'queued').length
     const printing = productions.filter(p => p.status === 'printing').length
     const done = productions.filter(p => p.status === 'done').length
-    const totalGrams = productions
-        .filter(p => p.status === 'done')
+    const totalGrams = productions.filter(p => p.status === 'done')
         .reduce((s, p) => s + (p.filament_grams || 0), 0)
-    const totalCost = productions
-        .filter(p => p.status === 'done')
-        .reduce((s, p) => s + (p.actual_cost || 0), 0)
 
     const si = key => STATUSES.find(s => s.key === key) || STATUSES[0]
 
     return (
         <div className="max-w-4xl mx-auto">
-
-            {/* Header */}
             <div className="flex items-center justify-between mb-6">
                 <div>
                     <h1 className="text-2xl font-bold text-slate-800">Productions</h1>
@@ -163,46 +232,40 @@ export default function Productions() {
                 </div>
                 <div className="bg-white rounded-2xl border border-slate-100 shadow-sm p-4 text-center">
                     <p className="text-2xl font-bold text-sky-500">{totalGrams.toFixed(0)}g</p>
-                    <p className="text-xs text-slate-400 mt-0.5">🧵 Total Used</p>
+                    <p className="text-xs text-slate-400 mt-0.5">🧵 Filament Used</p>
                 </div>
             </div>
 
             {/* Filters */}
             <div className="flex gap-2 mb-5">
-                {[
-                    { key: 'active', label: '🔥 Active' },
-                    { key: 'done', label: '✅ Done' },
-                    { key: 'all', label: 'All' },
-                ].map(f => (
+                {[{ key: 'active', label: '🔥 Active' }, { key: 'done', label: '✅ Done' }, { key: 'all', label: 'All' }].map(f => (
                     <button key={f.key} onClick={() => setFilter(f.key)}
                         className={`px-3 py-2 rounded-xl text-sm font-medium transition-colors
-              ${filterStatus === f.key ? 'bg-sky-500 text-white' : 'bg-white border border-slate-200 text-slate-600 hover:bg-slate-50'}`}>
+              ${filterStatus === f.key ? 'bg-sky-500 text-white' : 'bg-white border border-slate-200 text-slate-600'}`}>
                         {f.label}
                     </button>
                 ))}
             </div>
 
-            {/* Print Queue — priority view when active filter */}
+            {/* Print queue view */}
             {filterStatus === 'active' && filtered.length > 0 && (
                 <div className="bg-amber-50 border border-amber-200 rounded-2xl p-4 mb-5">
-                    <p className="text-sm font-bold text-amber-700 mb-3">🖨️ Print Queue — {filtered.length} job{filtered.length > 1 ? 's' : ''}</p>
+                    <p className="text-sm font-bold text-amber-700 mb-3">
+                        🖨️ Print Queue — {filtered.length} job{filtered.length > 1 ? 's' : ''}
+                    </p>
                     <div className="space-y-2">
-                        {filtered
-                            .sort((a, b) => {
-                                // Printing first, then queued
-                                if (a.status === 'printing' && b.status !== 'printing') return -1
-                                if (b.status === 'printing' && a.status !== 'printing') return 1
-                                return 0
-                            })
+                        {[...filtered]
+                            .sort((a, b) => a.status === 'printing' ? -1 : b.status === 'printing' ? 1 : 0)
                             .map((p, idx) => (
                                 <div key={p.id} className="flex items-center gap-3 bg-white rounded-xl px-3 py-2.5 border border-amber-100">
                                     <span className="text-slate-400 text-xs font-bold w-4">{idx + 1}</span>
                                     <div className="flex-1 min-w-0">
                                         <p className="text-sm font-medium text-slate-800 truncate">
                                             {p.products?.name || p.description || 'Custom job'}
+                                            {p.quantity > 1 ? ` ×${p.quantity}` : ''}
                                         </p>
                                         <p className="text-xs text-slate-400">
-                                            {p.orders?.clients?.name ? `📋 ${p.orders.clients.name}` : 'No order linked'}
+                                            {p.orders?.clients?.name ? `📋 ${p.orders.clients.name}` : '📦 Stock production'}
                                             {p.material ? ` · ${p.material}` : ''}
                                         </p>
                                     </div>
@@ -222,7 +285,6 @@ export default function Productions() {
                 <div className="text-center py-20">
                     <Printer size={48} className="mx-auto text-slate-300 mb-3" />
                     <p className="text-slate-400 font-medium">No productions here</p>
-                    <p className="text-slate-400 text-sm">Log a print job to get started</p>
                 </div>
             ) : (
                 <div className="flex flex-col gap-3">
@@ -232,63 +294,49 @@ export default function Productions() {
                             <div key={p.id} className="bg-white rounded-2xl border border-slate-100 shadow-sm p-4">
                                 <div className="flex items-start justify-between mb-3">
                                     <div className="flex-1 min-w-0">
-                                        <div className="flex items-center gap-2 mb-1">
+                                        <div className="flex items-center gap-2 mb-1 flex-wrap">
                                             <span className={`text-xs font-semibold px-2 py-0.5 rounded-full ${s.color}`}>
                                                 {s.emoji} {s.label}
                                             </span>
-                                            {p.material && (
-                                                <span className="text-xs px-2 py-0.5 rounded-full bg-slate-100 text-slate-500">
-                                                    {p.material}
-                                                </span>
-                                            )}
-                                            {p.color && (
-                                                <span className="text-xs px-2 py-0.5 rounded-full bg-slate-100 text-slate-500">
-                                                    {p.color}
-                                                </span>
-                                            )}
+                                            {p.material && <span className="text-xs px-2 py-0.5 rounded-full bg-slate-100 text-slate-500">{p.material}</span>}
+                                            {p.color && <span className="text-xs px-2 py-0.5 rounded-full bg-slate-100 text-slate-500">{p.color}</span>}
+                                            {!p.order_id && <span className="text-xs px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-600">📦 Stock</span>}
                                         </div>
                                         <h3 className="font-semibold text-slate-800">
                                             {p.products?.name || p.description || 'Custom job'}
+                                            {(p.quantity || 1) > 1 && <span className="text-slate-400 font-normal"> ×{p.quantity}</span>}
                                         </h3>
                                         {p.orders?.clients?.name && (
-                                            <p className="text-xs text-slate-400 mt-0.5">
-                                                📋 Order: {p.orders.clients.name}
-                                            </p>
+                                            <p className="text-xs text-slate-400 mt-0.5">📋 {p.orders.clients.name}</p>
                                         )}
                                     </div>
                                     <div className="flex gap-1 ml-2">
                                         <button onClick={() => openEdit(p)}
-                                            className="p-1.5 text-slate-400 hover:text-sky-500 hover:bg-sky-50 rounded-lg transition-colors text-xs">
-                                            ✏️
-                                        </button>
+                                            className="p-1.5 text-slate-400 hover:text-sky-500 hover:bg-sky-50 rounded-lg text-xs">✏️</button>
                                         <button onClick={() => setDeleting(p)}
-                                            className="p-1.5 text-slate-400 hover:text-red-500 hover:bg-red-50 rounded-lg transition-colors">
+                                            className="p-1.5 text-slate-400 hover:text-red-500 hover:bg-red-50 rounded-lg">
                                             <Trash2 size={14} />
                                         </button>
                                     </div>
                                 </div>
 
-                                {/* Stats row */}
                                 <div className="flex flex-wrap gap-4 text-sm py-3 border-t border-b border-slate-50 mb-3">
                                     {p.filament_grams && (
                                         <div className="flex items-center gap-1.5 text-slate-600">
-                                            <span className="text-base">🧵</span>
+                                            <span>🧵</span>
                                             <span className="font-semibold">{p.filament_grams}g</span>
-                                            <span className="text-slate-400 text-xs">filament</span>
                                         </div>
                                     )}
                                     {p.print_time_hours && (
                                         <div className="flex items-center gap-1.5 text-slate-600">
                                             <Clock size={14} className="text-slate-400" />
                                             <span className="font-semibold">{p.print_time_hours}h</span>
-                                            <span className="text-slate-400 text-xs">print time</span>
                                         </div>
                                     )}
                                     {p.actual_cost && (
                                         <div className="flex items-center gap-1.5 text-slate-600">
                                             <Zap size={14} className="text-slate-400" />
                                             <span className="font-semibold">{p.actual_cost} TND</span>
-                                            <span className="text-slate-400 text-xs">cost</span>
                                         </div>
                                     )}
                                 </div>
@@ -296,17 +344,21 @@ export default function Productions() {
                                 {/* Quick status buttons */}
                                 <div className="flex gap-2">
                                     {STATUSES.filter(s => s.key !== p.status).map(s => (
-                                        <button key={s.key}
-                                            onClick={() => updateStatus(p.id, s.key)}
+                                        <button key={s.key} onClick={() => updateStatus(p.id, s.key)}
                                             className="flex-1 py-1.5 text-xs font-medium bg-slate-50 hover:bg-slate-100 rounded-lg border border-slate-200 text-slate-500 transition-colors">
                                             {s.emoji} {s.label}
                                         </button>
                                     ))}
                                 </div>
 
-                                {p.notes && (
-                                    <p className="text-xs text-slate-400 mt-2 italic">"{p.notes}"</p>
+                                {/* Stock note */}
+                                {p.status === 'done' && !p.order_id && p.product_id && (
+                                    <p className="text-xs text-emerald-600 mt-2 font-medium">
+                                        ✅ Added to stock automatically
+                                    </p>
                                 )}
+
+                                {p.notes && <p className="text-xs text-slate-400 mt-2 italic">"{p.notes}"</p>}
                             </div>
                         )
                     })}
@@ -321,30 +373,36 @@ export default function Productions() {
                             <h2 className="text-lg font-bold text-slate-800">
                                 {editing ? 'Edit Job' : 'New Print Job'}
                             </h2>
-                            <button onClick={closeModal} className="p-2 hover:bg-slate-100 rounded-xl">
-                                <X size={20} />
-                            </button>
+                            <button onClick={closeModal} className="p-2 hover:bg-slate-100 rounded-xl"><X size={20} /></button>
                         </div>
 
                         <div className="p-5 space-y-4">
 
-                            {/* Link to order */}
+                            {/* Linked order */}
                             <div>
                                 <label className="text-sm font-medium text-slate-700 block mb-1">
-                                    Linked Order <span className="text-slate-400 font-normal">(optional)</span>
+                                    Linked Order <span className="text-slate-400 font-normal">(leave empty for stock production)</span>
                                 </label>
                                 <select name="order_id" value={form.order_id} onChange={handleChange}
                                     className="w-full border border-slate-200 rounded-xl px-3 py-2.5 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-sky-300">
-                                    <option value="">No order linked (stock production)</option>
+                                    <option value="">📦 No order — producing for stock</option>
                                     {orders.map(o => (
                                         <option key={o.id} value={o.id}>
                                             {o.clients?.name} — {o.custom_description || 'Standard order'}
                                         </option>
                                     ))}
                                 </select>
+
+                                {!form.order_id && (
+                                    <div className="mt-2 bg-emerald-50 border border-emerald-200 rounded-xl p-2.5">
+                                        <p className="text-xs text-emerald-700 font-medium">
+                                            📦 When marked Done, quantity will be automatically added to stock
+                                        </p>
+                                    </div>
+                                )}
                             </div>
 
-                            {/* Product or description */}
+                            {/* Product selection + inline create */}
                             <div>
                                 <label className="text-sm font-medium text-slate-700 block mb-1">Product</label>
                                 <select name="product_id" value={form.product_id} onChange={handleChange}
@@ -352,8 +410,44 @@ export default function Productions() {
                                     <option value="">Custom / not in catalogue</option>
                                     {products.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
                                 </select>
+
+                                <button onClick={() => setShowNewProduct(true)}
+                                    className="mt-1.5 text-xs text-sky-500 hover:text-sky-700 flex items-center gap-1">
+                                    <PackagePlus size={12} /> Add new product to catalogue
+                                </button>
+
+                                {showNewProduct && (
+                                    <div className="mt-2 bg-sky-50 border border-sky-200 rounded-xl p-3 space-y-2">
+                                        <p className="text-xs font-bold text-sky-700">New Product</p>
+                                        <input value={newProduct.name}
+                                            onChange={e => setNewProduct(f => ({ ...f, name: e.target.value }))}
+                                            placeholder="Product name *"
+                                            className="w-full border border-sky-200 rounded-lg px-3 py-2 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-sky-300" />
+                                        <div className="grid grid-cols-2 gap-2">
+                                            <select value={newProduct.category}
+                                                onChange={e => setNewProduct(f => ({ ...f, category: e.target.value }))}
+                                                className="border border-slate-200 rounded-lg px-2 py-2 text-sm bg-white focus:outline-none">
+                                                {CATEGORIES.map(c => <option key={c}>{c}</option>)}
+                                            </select>
+                                            <input type="number" value={newProduct.selling_price}
+                                                onChange={e => setNewProduct(f => ({ ...f, selling_price: e.target.value }))}
+                                                placeholder="Selling price (TND)"
+                                                className="border border-slate-200 rounded-lg px-2 py-2 text-sm focus:outline-none" />
+                                        </div>
+                                        <div className="flex gap-2">
+                                            <button onClick={() => setShowNewProduct(false)}
+                                                className="flex-1 py-2 text-xs border border-slate-200 rounded-lg hover:bg-white">Cancel</button>
+                                            <button onClick={createProductInline}
+                                                disabled={savingProduct || !newProduct.name.trim()}
+                                                className="flex-1 py-2 text-xs bg-sky-500 text-white rounded-lg hover:bg-sky-600 disabled:opacity-50 font-medium">
+                                                {savingProduct ? 'Adding...' : '+ Create & Select'}
+                                            </button>
+                                        </div>
+                                    </div>
+                                )}
                             </div>
 
+                            {/* Description */}
                             {!form.product_id && (
                                 <div>
                                     <label className="text-sm font-medium text-slate-700 block mb-1">Description *</label>
@@ -363,8 +457,13 @@ export default function Productions() {
                                 </div>
                             )}
 
-                            {/* Material + Color */}
-                            <div className="grid grid-cols-2 gap-3">
+                            {/* Quantity + Material + Color */}
+                            <div className="grid grid-cols-3 gap-3">
+                                <div>
+                                    <label className="text-sm font-medium text-slate-700 block mb-1">Quantity</label>
+                                    <input name="quantity" type="number" min="1" value={form.quantity} onChange={handleChange}
+                                        className="w-full border border-slate-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-sky-300" />
+                                </div>
                                 <div>
                                     <label className="text-sm font-medium text-slate-700 block mb-1">Material</label>
                                     <select name="material" value={form.material} onChange={handleChange}
@@ -375,7 +474,7 @@ export default function Productions() {
                                 <div>
                                     <label className="text-sm font-medium text-slate-700 block mb-1">Color</label>
                                     <input name="color" value={form.color} onChange={handleChange}
-                                        placeholder="e.g. Black, Red..."
+                                        placeholder="e.g. Black"
                                         className="w-full border border-slate-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-sky-300" />
                                 </div>
                             </div>
@@ -396,21 +495,18 @@ export default function Productions() {
                                 </div>
                             </div>
 
-                            {/* Auto-calculated cost */}
                             <div>
                                 <label className="text-sm font-medium text-slate-700 block mb-1">
-                                    Production Cost (TND)
-                                    <span className="text-xs text-sky-500 ml-1">auto-calculated</span>
+                                    Production Cost (TND) <span className="text-xs text-sky-500">auto-calculated</span>
                                 </label>
                                 <input name="actual_cost" type="number" value={form.actual_cost} onChange={handleChange}
                                     placeholder="0.00"
                                     className="w-full border border-slate-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-sky-300 bg-sky-50 font-semibold" />
                                 <p className="text-xs text-slate-400 mt-1">
-                                    Based on {FILAMENT_PRICE_PER_KG} TND/kg filament + {ELECTRICITY_PER_HOUR} TND/hr electricity
+                                    {FILAMENT_PRICE_PER_KG} TND/kg filament + {ELECTRICITY_PER_HOUR} TND/hr electricity
                                 </p>
                             </div>
 
-                            {/* Status */}
                             <div>
                                 <label className="text-sm font-medium text-slate-700 block mb-2">Status</label>
                                 <div className="grid grid-cols-2 gap-2">
@@ -418,16 +514,13 @@ export default function Productions() {
                                         <button key={s.key}
                                             onClick={() => setForm(f => ({ ...f, status: s.key }))}
                                             className={`py-2.5 rounded-xl text-sm font-medium border transition-all
-                        ${form.status === s.key
-                                                    ? 'border-sky-400 bg-sky-50 text-sky-700 ring-2 ring-sky-200'
-                                                    : 'border-slate-200 bg-white text-slate-500 hover:bg-slate-50'}`}>
+                        ${form.status === s.key ? 'border-sky-400 bg-sky-50 text-sky-700 ring-2 ring-sky-200' : 'border-slate-200 bg-white text-slate-500 hover:bg-slate-50'}`}>
                                             {s.emoji} {s.label}
                                         </button>
                                     ))}
                                 </div>
                             </div>
 
-                            {/* Notes */}
                             <div>
                                 <label className="text-sm font-medium text-slate-700 block mb-1">Notes</label>
                                 <textarea name="notes" value={form.notes} onChange={handleChange}
@@ -439,9 +532,7 @@ export default function Productions() {
 
                         <div className="p-5 pt-0 flex gap-3">
                             <button onClick={closeModal}
-                                className="flex-1 py-3 border border-slate-200 rounded-xl text-sm font-medium hover:bg-slate-50">
-                                Cancel
-                            </button>
+                                className="flex-1 py-3 border border-slate-200 rounded-xl text-sm font-medium hover:bg-slate-50">Cancel</button>
                             <button onClick={saveProd}
                                 disabled={saving || (!form.description && !form.product_id)}
                                 className="flex-1 py-3 bg-sky-500 hover:bg-sky-600 disabled:opacity-50 text-white rounded-xl text-sm font-medium">
@@ -452,23 +543,18 @@ export default function Productions() {
                 </div>
             )}
 
-            {/* Delete confirm */}
             {deleting && (
                 <div className="fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4">
                     <div className="bg-white rounded-2xl shadow-2xl p-6 max-w-sm w-full">
                         <h3 className="font-bold text-slate-800 text-lg mb-1">Delete job?</h3>
                         <p className="text-slate-500 text-sm mb-5">
-                            "<span className="font-medium">{deleting.products?.name || deleting.description}</span>" will be removed.
+                            "{deleting.products?.name || deleting.description}" will be removed.
                         </p>
                         <div className="flex gap-3">
                             <button onClick={() => setDeleting(null)}
-                                className="flex-1 py-2.5 border border-slate-200 rounded-xl text-sm font-medium hover:bg-slate-50">
-                                Cancel
-                            </button>
+                                className="flex-1 py-2.5 border border-slate-200 rounded-xl text-sm font-medium hover:bg-slate-50">Cancel</button>
                             <button onClick={() => deleteProd(deleting.id)}
-                                className="flex-1 py-2.5 bg-red-500 hover:bg-red-600 text-white rounded-xl text-sm font-medium">
-                                Delete
-                            </button>
+                                className="flex-1 py-2.5 bg-red-500 hover:bg-red-600 text-white rounded-xl text-sm font-medium">Delete</button>
                         </div>
                     </div>
                 </div>
