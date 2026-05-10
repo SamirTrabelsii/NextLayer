@@ -1,6 +1,10 @@
 import { useState, useEffect } from 'react'
 import { supabase } from '../lib/supabase'
 import { Plus, X, Trash2, Printer, Clock, Zap, PackagePlus } from 'lucide-react'
+import { calcProductionCost, FILAMENT_PRICE_PER_KG, ELECTRICITY_PER_HOUR } from '../lib/costUtils'
+// const FILAMENT_PRICE_PER_KG = 35
+// const ELECTRICITY_PER_HOUR = 0.15
+
 
 const STATUSES = [
     { key: 'queued', label: 'Queued', emoji: '⏳', color: 'bg-slate-100 text-slate-600' },
@@ -11,8 +15,6 @@ const STATUSES = [
 const MATERIALS = ['PLA', 'PETG', 'ABS', 'TPU', 'Resin', 'Other']
 const CATEGORIES = ['Keychains', 'Clickers', 'Decorations', 'Custom Orders']
 
-const FILAMENT_PRICE_PER_KG = 35
-const ELECTRICITY_PER_HOUR = 0.15
 
 const empty = {
     order_id: '', product_id: '', description: '', quantity: 1,
@@ -75,15 +77,22 @@ export default function Productions() {
     function handleChange(e) {
         const { name, value } = e.target
         const updated = { ...form, [name]: value }
+
+        // Auto-calculate cost whenever filament or time changes
         if (name === 'filament_grams' || name === 'print_time_hours') {
-            const grams = parseFloat(name === 'filament_grams' ? value : updated.filament_grams) || 0
-            const hours = parseFloat(name === 'print_time_hours' ? value : updated.print_time_hours) || 0
-            updated.actual_cost = ((grams / 1000 * FILAMENT_PRICE_PER_KG) + (hours * ELECTRICITY_PER_HOUR)).toFixed(2)
+            updated.actual_cost = calcProductionCost(
+                name === 'filament_grams' ? value : form.filament_grams,
+                name === 'print_time_hours' ? value : form.print_time_hours
+                // Note: BOM materials not included here since they're on the product
+                // The product's cost already includes materials
+            )
         }
+
         if (name === 'order_id' && value && !updated.description) {
             const order = orders.find(o => o.id === value)
             if (order) updated.description = order.custom_description || ''
         }
+
         setForm(updated)
     }
 
@@ -154,30 +163,73 @@ export default function Productions() {
     }
 
     async function updateStatus(id, status) {
-        await supabase.from('productions').update({ status }).eq('id', id)
-
         const prod = productions.find(p => p.id === id)
+        if (!prod) return
 
-        if (status === 'done' && prod) {
-            if (prod.order_id) {
-                // Has order → advance order to 'ready' if it's 'in_production'
-                const { data: order } = await supabase.from('orders')
-                    .select('status').eq('id', prod.order_id).single()
-                if (order?.status === 'in_production') {
-                    await supabase.from('orders').update({ status: 'ready' }).eq('id', prod.order_id)
+        // ── When marking DONE ──────────────────────────────────────
+        if (status === 'done') {
+
+            // 1. Consume materials via atomic DB function
+            if (prod.product_id) {
+                const qty = parseInt(prod.quantity) || 1
+                const { data: matResult } = await supabase.rpc('consume_materials_atomic', {
+                    p_product_id: prod.product_id,
+                    p_quantity: qty,
+                    p_production_id: id,
+                })
+                if (matResult && !matResult.success) {
+                    const reason = matResult.reason === 'insufficient_material'
+                        ? `Not enough ${matResult.material}. Need ${matResult.needed}, have ${matResult.available}.`
+                        : 'Material consumption failed.'
+                    alert(`⚠️ ${reason}\n\nProduction marked done but materials were not consumed. Please adjust stock manually.`)
                 }
-            } else if (prod.product_id) {
-                // No order → add to stock automatically
-                await addToStock({ ...prod, status: 'done' })
             }
-        }
 
-        if (status === 'printing' && prod?.order_id) {
-            // Sync order to in_production
-            const { data: order } = await supabase.from('orders')
-                .select('status').eq('id', prod.order_id).single()
-            if (order && ['confirmed', 'quoted'].includes(order.status)) {
-                await supabase.from('orders').update({ status: 'in_production' }).eq('id', prod.order_id)
+            // 2. Calculate actual cost and sync to product
+            const actualCost = calcProductionCost(prod.filament_grams, prod.print_time_hours)
+
+            if (prod.product_id && actualCost > 0) {
+                // Sync actual cost back to the product's production_cost
+                // This keeps product cost aligned with real production data
+                await supabase.from('products')
+                    .update({ production_cost: actualCost })
+                    .eq('id', prod.product_id)
+            }
+
+            // Update the production with the final cost
+            await supabase.from('productions')
+                .update({ status, actual_cost: actualCost > 0 ? actualCost : prod.actual_cost })
+                .eq('id', id)
+
+            // 3. If no order → add to stock
+            if (!prod.order_id && prod.product_id) {
+                await addToStock(prod)
+            }
+
+            // 4. If has order → advance order to 'ready'
+            if (prod.order_id) {
+                const { data: order } = await supabase
+                    .from('orders').select('status').eq('id', prod.order_id).single()
+                if (order?.status === 'in_production') {
+                    await supabase.from('orders')
+                        .update({ status: 'ready' })
+                        .eq('id', prod.order_id)
+                }
+            }
+
+        } else {
+            // Other status changes
+            await supabase.from('productions').update({ status }).eq('id', id)
+
+            // When marking PRINTING → sync order to in_production
+            if (status === 'printing' && prod.order_id) {
+                const { data: order } = await supabase
+                    .from('orders').select('status').eq('id', prod.order_id).single()
+                if (order && ['confirmed', 'quoted', 'new'].includes(order.status)) {
+                    await supabase.from('orders')
+                        .update({ status: 'in_production' })
+                        .eq('id', prod.order_id)
+                }
             }
         }
 

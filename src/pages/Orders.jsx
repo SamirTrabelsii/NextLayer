@@ -75,6 +75,17 @@ export default function Orders() {
     const [clientSearch, setClientSearch] = useState('')
     const [showClientDrop, setShowClientDrop] = useState(false)
 
+    // ✅ These 3 were added recently — must also be INSIDE the function
+    const [editingOrder, setEditingOrder] = useState(false)
+    const [editForm, setEditForm] = useState({})
+    const [savingEdit, setSavingEdit] = useState(false)
+
+    const [showPackagingModal, setShowPackagingModal] = useState(false)
+    const [pendingDelivery, setPendingDelivery] = useState(null)
+    const [packagingMaterials, setPackagingMaterials] = useState([])
+    const [packagingSelection, setPackagingSelection] = useState({}) // { material_id: quantity }
+    const [loadingPkg, setLoadingPkg] = useState(false)
+    const [confirmingPkg, setConfirmingPkg] = useState(false)
     // ─── DATA FETCHING ──────────────────────────────────────────
     const fetchAll = useCallback(async () => {
         setLoading(true)
@@ -205,38 +216,36 @@ export default function Orders() {
     }
 
     // ─── CHECK STOCK FOR STANDARD ORDERS ─────────────────────────
-    async function checkAndReduceStock(orderItems, orderId, clientName) {
-        const results = { allAvailable: true, stockOps: [] }
+    // Replace checkAndReduceStock entirely with this:
+    async function reduceStockAtomic(orderItems, orderId, clientName) {
+        const results = []
+
         for (const item of orderItems.filter(i => i.product_id)) {
             const qty = parseInt(item.quantity) || 1
-            const { data: stockRow } = await supabase
-                .from('stock').select('id, quantity_available')
-                .eq('product_id', item.product_id).single()
-            const available = stockRow?.quantity_available ?? 0
-            if (available < qty) {
-                results.allAvailable = false
-                break
-            }
-            results.stockOps.push({ stockRow, product_id: item.product_id, qty, orderId, clientName })
-        }
-        if (results.allAvailable) {
-            for (const op of results.stockOps) {
-                await supabase.from('stock').update({
-                    quantity_available: op.stockRow.quantity_available - op.qty,
-                    updated_at: new Date().toISOString(),
-                }).eq('id', op.stockRow.id)
-                await supabase.from('stock_movements').insert([{
-                    product_id: op.product_id,
-                    type: 'sold',
-                    quantity: op.qty,
-                    is_positive: false,
-                    order_id: op.orderId,
-                    notes: `Sold — ${op.clientName}`,
-                }])
+
+            const { data, error } = await supabase.rpc('reduce_stock_atomic', {
+                p_product_id: item.product_id,
+                p_quantity: qty,
+                p_order_id: orderId,
+                p_notes: `Sold — ${clientName}`,
+            })
+
+            if (error || !data?.success) {
+                results.push({
+                    success: false,
+                    product_id: item.product_id,
+                    reason: data?.reason || 'error',
+                    available: data?.available ?? 0,
+                })
+            } else {
+                results.push({ success: true, product_id: item.product_id })
             }
         }
-        return results.allAvailable
+
+        const allOk = results.every(r => r.success)
+        return { allOk, results }
     }
+
 
     // ─── AUTO-CREATE PRODUCTION (custom orders only) ──────────────
     async function autoCreateProduction(order) {
@@ -249,6 +258,76 @@ export default function Orders() {
             status: 'queued',
             material: 'PLA',
         }])
+    }
+    // ── Open packaging modal before delivering ────────────────────
+    async function initDelivery(order) {
+        setLoadingPkg(true)
+        setPendingDelivery(order)
+        setPackagingSelection({})
+
+        const { data: mats } = await supabase
+            .from('materials')
+            .select('*')
+            .gt('quantity_available', 0)
+            .order('category')
+            .order('name')
+
+        setPackagingMaterials(mats || [])
+        setLoadingPkg(false)
+        setShowPackagingModal(true)
+    }
+
+    // ── Confirm delivery: consume packaging then advance order ────
+    async function confirmDelivery(skipPackaging = false) {
+        if (!pendingDelivery) return
+        setConfirmingPkg(true)
+
+        try {
+            if (!skipPackaging) {
+                const selected = Object.entries(packagingSelection).filter(([, qty]) => qty > 0)
+
+                for (const [materialId, qty] of selected) {
+                    const mat = packagingMaterials.find(m => m.id === materialId)
+                    if (!mat) continue
+
+                    // Deduct from material stock
+                    await supabase.from('materials').update({
+                        quantity_available: Math.max(0, mat.quantity_available - qty),
+                    }).eq('id', materialId)
+
+                    // Log movement
+                    await supabase.from('material_movements').insert([{
+                        material_id: materialId,
+                        type: 'used',
+                        quantity: qty,
+                        is_positive: false,
+                        notes: `Packaging — ${pendingDelivery.clients?.name || 'order'}`,
+                    }])
+                }
+            }
+
+            // Close modal first, then advance order
+            setShowPackagingModal(false)
+            setPendingDelivery(null)
+            setPackagingSelection([])
+
+            await applyStatusChange(pendingDelivery, 'delivered')
+
+        } catch (err) {
+            console.error('Delivery error:', err)
+            setError('Failed to confirm delivery.')
+        } finally {
+            setConfirmingPkg(false)
+        }
+    }
+
+    // ── Helper: should this status change trigger packaging modal? ─
+    function handleStatusAdvance(order, targetStatus) {
+        if (targetStatus === 'delivered') {
+            initDelivery(order)
+        } else {
+            applyStatusChange(order, targetStatus)
+        }
     }
 
     // ─── SAVE ORDER ───────────────────────────────────────────────
@@ -264,24 +343,23 @@ export default function Orders() {
             let finalPrice = parseFloat(form.total_price) || null
 
             if (form.type === 'standard') {
-                // Calculate total from items
                 finalPrice = calcTotal(validItems) || null
-                // Check stock to determine initial status
-                const hasStockItems = validItems.some(i => i.product_id)
-                if (hasStockItems) {
-                    // Check availability without reducing yet
-                    let allAvailable = true
+
+                const hasProducts = validItems.some(i => i.product_id)
+                if (hasProducts) {
+                    // Pre-check availability (read-only, fast)
+                    let canFulfill = true
                     for (const item of validItems.filter(i => i.product_id)) {
                         const qty = parseInt(item.quantity) || 1
                         const { data: stockRow } = await supabase
                             .from('stock').select('quantity_available')
                             .eq('product_id', item.product_id).single()
                         if ((stockRow?.quantity_available ?? 0) < qty) {
-                            allAvailable = false
+                            canFulfill = false
                             break
                         }
                     }
-                    initialStatus = allAvailable ? 'ready' : 'waiting_restock'
+                    initialStatus = canFulfill ? 'ready' : 'waiting_restock'
                 } else {
                     initialStatus = 'ready'
                 }
@@ -307,21 +385,15 @@ export default function Orders() {
             if (orderErr) throw orderErr
 
             // Save order items for standard orders
-            if (form.type === 'standard' && validItems.length > 0) {
-                const { error: itemsErr } = await supabase.from('order_items').insert(
-                    validItems.map(i => ({
-                        order_id: order.id,
-                        product_id: i.product_id || null,
-                        custom_description: i.custom_description || null,
-                        quantity: parseInt(i.quantity) || 1,
-                        unit_price: parseFloat(i.unit_price) || null,
-                    }))
+            if (form.type === 'standard' && initialStatus === 'ready') {
+                const { allOk, results } = await reduceStockAtomic(
+                    validItems, order.id, client?.name || ''
                 )
-                if (itemsErr) throw itemsErr
-
-                // If ready, reduce stock now
-                if (initialStatus === 'ready') {
-                    await checkAndReduceStock(validItems, order.id, client?.name || '')
+                if (!allOk) {
+                    // Stock changed between check and reduction — mark as waiting_restock
+                    await supabase.from('orders')
+                        .update({ status: 'waiting_restock' })
+                        .eq('id', order.id)
                 }
             }
 
@@ -338,6 +410,27 @@ export default function Orders() {
         } finally {
             setSaving(false)
         }
+    }
+
+    async function saveOrderEdit() {
+        if (!selected) return
+        setSavingEdit(true)
+        const payload = {
+            total_price: parseFloat(editForm.total_price) || null,
+            deadline: editForm.deadline || null,
+            notes: editForm.notes || null,
+            custom_description: editForm.custom_description || null,
+            dimensions: editForm.dimensions || null,
+            reference_notes: editForm.reference_notes || null,
+        }
+        const { error } = await supabase.from('orders')
+            .update(payload).eq('id', selected.id)
+        if (!error) {
+            setSelected(prev => ({ ...prev, ...payload }))
+            setEditingOrder(false)
+            await fetchAll()
+        }
+        setSavingEdit(false)
     }
 
     // ─── SYNC PRODUCTION WITH ORDER STATUS ───────────────────────
@@ -364,46 +457,114 @@ export default function Orders() {
     async function applyStatusChange(order, next) {
         setSaving(true)
         setError('')
+
         try {
-            // Special: waiting_restock → ready (must check + reduce stock)
+
+            // ── WAITING RESTOCK → READY ──────────────────────────────
+            // Must verify stock is available now, then reduce it
             if (order.status === 'waiting_restock' && next === 'ready') {
-                const { data: orderItems } = await supabase
-                    .from('order_items').select('*')
+
+                // 1. Fetch order items fresh from DB
+                const { data: orderItems, error: itemsErr } = await supabase
+                    .from('order_items')
+                    .select('*, products(name)')
                     .eq('order_id', order.id)
-                const client = clients.find(c => c.id === order.clients?.id) || order.clients
-                const stockOk = await checkAndReduceStock(orderItems || [], order.id, client?.name || '')
-                if (!stockOk) {
-                    setError('Still not enough stock for this order.')
-                    setSaving(false)
-                    return
+
+                if (itemsErr) throw new Error('Could not load order items.')
+
+                const productItems = (orderItems || []).filter(i => i.product_id)
+
+                if (productItems.length === 0) {
+                    // No catalogue products in order — just advance
+                } else {
+                    // 2. Check every product has enough stock
+                    for (const item of productItems) {
+                        const needed = parseInt(item.quantity) || 1
+                        const { data: stockRow } = await supabase
+                            .from('stock')
+                            .select('quantity_available')
+                            .eq('product_id', item.product_id)
+                            .single()
+
+                        const available = stockRow?.quantity_available ?? 0
+
+                        if (available < needed) {
+                            setError(
+                                `Still not enough stock for "${item.products?.name || 'product'}". ` +
+                                `Need ${needed}, only ${available} available. Add more stock first.`
+                            )
+                            setSaving(false)
+                            return
+                        }
+                    }
+
+                    // 3. All good — reduce stock for each item
+                    for (const item of productItems) {
+                        const qty = parseInt(item.quantity) || 1
+
+                        const { data: stockRow } = await supabase
+                            .from('stock')
+                            .select('id, quantity_available')
+                            .eq('product_id', item.product_id)
+                            .single()
+
+                        if (stockRow) {
+                            await supabase.from('stock').update({
+                                quantity_available: Math.max(0, stockRow.quantity_available - qty),
+                                updated_at: new Date().toISOString(),
+                            }).eq('id', stockRow.id)
+
+                            await supabase.from('stock_movements').insert([{
+                                product_id: item.product_id,
+                                type: 'sold',
+                                quantity: qty,
+                                is_positive: false,
+                                order_id: order.id,
+                                notes: `Restocked & fulfilled — ${order.clients?.name || ''}`,
+                            }])
+                        }
+                    }
                 }
             }
 
-            await supabase.from('orders').update({
-                status: next,
-                is_paid: next === 'paid',
-            }).eq('id', order.id)
+            // ── UPDATE ORDER STATUS ──────────────────────────────────
+            const { error: updateErr } = await supabase
+                .from('orders')
+                .update({ status: next, is_paid: next === 'paid' })
+                .eq('id', order.id)
 
-            // Sync production for custom orders
+            if (updateErr) throw new Error(updateErr.message)
+
+            // ── SYNC PRODUCTION (custom orders only) ─────────────────
             if (order.type === 'custom') {
                 await syncProduction(order.id, next)
-                // Auto-create production when confirmed (if not already exists)
+
+                // Auto-create production when confirmed if none exists
                 if (next === 'confirmed') {
                     const { data: existing } = await supabase
-                        .from('productions').select('id').eq('order_id', order.id).single()
+                        .from('productions')
+                        .select('id')
+                        .eq('order_id', order.id)
+                        .maybeSingle()
+
                     if (!existing) await autoCreateProduction(order)
                 }
             }
 
-            // If selected panel is open, update it
+            // ── UPDATE LOCAL STATE ────────────────────────────────────
             if (selected?.id === order.id) {
-                setSelected(prev => ({ ...prev, status: next, is_paid: next === 'paid' }))
+                setSelected(prev => ({
+                    ...prev,
+                    status: next,
+                    is_paid: next === 'paid',
+                }))
             }
 
             await fetchAll()
+
         } catch (err) {
             console.error('Status change error:', err)
-            setError('Failed to update status.')
+            setError(err.message || 'Failed to update status. Please try again.')
         } finally {
             setSaving(false)
         }
@@ -626,7 +787,12 @@ export default function Orders() {
                                 {next && !TERMINAL.includes(o.status) && (
                                     <div className="px-4 pb-3">
                                         <button
-                                            onClick={e => { e.stopPropagation(); advanceStatus(o) }}
+                                            onClick={e => {
+                                                e.stopPropagation()
+                                                const next = getNextStatus(o)
+                                                if (!next) return
+                                                handleStatusAdvance(o, next)
+                                            }}
                                             disabled={saving}
                                             className={`w-full py-2 rounded-xl text-xs font-semibold flex items-center justify-center gap-1.5 transition-all border
                         ${o.status === 'waiting_restock'
@@ -1026,24 +1192,154 @@ export default function Orders() {
                                     <div className="space-y-2">
                                         <div className="bg-pink-50 border border-pink-200 rounded-xl p-3">
                                             <p className="text-sm font-bold text-pink-700">⏸️ Waiting for restock</p>
-                                            <p className="text-xs text-pink-500 mt-0.5">
-                                                Product was out of stock when ordered. Add stock in the Stock page, then mark ready.
+                                            <p className="text-xs text-pink-500 mt-1">
+                                                Add stock in the <strong>Stock</strong> page, then come back and tap below.
                                             </p>
                                         </div>
-                                        <button onClick={() => applyStatusChange(selected, 'ready')} disabled={saving}
-                                            className="w-full py-3 bg-pink-500 hover:bg-pink-600 text-white rounded-xl font-semibold text-sm disabled:opacity-50 transition-colors">
-                                            ✅ Stock available → Mark Ready
+                                        <button
+                                            onClick={async () => {
+                                                // Always fetch the freshest version of the order before acting
+                                                const { data: freshOrder } = await supabase
+                                                    .from('orders')
+                                                    .select('*, clients(id, name, phone), order_items(*, products(name))')
+                                                    .eq('id', selected.id)
+                                                    .single()
+
+                                                if (freshOrder) {
+                                                    setSelected(freshOrder)
+                                                    await applyStatusChange(freshOrder, 'ready')
+                                                }
+                                            }}
+                                            disabled={saving}
+                                            className="w-full py-3 bg-pink-500 hover:bg-pink-600 text-white rounded-xl font-semibold text-sm disabled:opacity-50 transition-colors flex items-center justify-center gap-2">
+                                            {saving ? 'Checking stock...' : '✅ Stock available — Mark as Ready'}
                                         </button>
                                     </div>
                                 )
                                 if (!next) return null
                                 return (
-                                    <button onClick={() => applyStatusChange(selected, next)} disabled={saving}
+                                    <button onClick={() => {
+                                        const next = getNextStatus(selected)
+                                        if (!next) return
+                                        handleStatusAdvance(selected, next)
+                                    }} disabled={saving}
                                         className="w-full py-3.5 bg-sky-500 hover:bg-sky-600 text-white rounded-xl font-bold text-sm flex items-center justify-center gap-2 disabled:opacity-50 transition-colors shadow-sm">
                                         <ArrowRight size={16} /> Mark as {nextSI?.label}
                                     </button>
                                 )
                             })()}
+
+                            {/* ── EDIT TOGGLE ── */}
+                            {!TERMINAL.includes(selected.status) && !editingOrder && (
+                                <button
+                                    onClick={() => {
+                                        setEditForm({
+                                            total_price: selected.total_price || '',
+                                            deadline: selected.deadline || '',
+                                            notes: selected.notes || '',
+                                            custom_description: selected.custom_description || '',
+                                            dimensions: selected.dimensions || '',
+                                            reference_notes: selected.reference_notes || '',
+                                        })
+                                        setEditingOrder(true)
+                                    }}
+                                    className="w-full py-2.5 border-2 border-dashed border-slate-200 hover:border-sky-300 hover:text-sky-600 text-slate-400 rounded-xl text-sm font-medium transition-all">
+                                    ✏️ Edit order details
+                                </button>
+                            )}
+
+                            {/* ── EDIT FORM ── */}
+                            {editingOrder && (
+                                <div className="bg-slate-50 border-2 border-sky-200 rounded-2xl p-4 space-y-3">
+                                    <div className="flex items-center justify-between">
+                                        <p className="text-sm font-bold text-slate-700">Edit Order</p>
+                                        <button onClick={() => setEditingOrder(false)}
+                                            className="p-1 text-slate-400 hover:text-slate-600 rounded-lg">
+                                            <X size={16} />
+                                        </button>
+                                    </div>
+
+                                    {/* Price — always editable */}
+                                    <div>
+                                        <label className="text-xs font-semibold text-slate-500 block mb-1">
+                                            Price (TND)
+                                            {!selected.total_price && (
+                                                <span className="ml-2 text-amber-500 font-normal">— not set yet</span>
+                                            )}
+                                        </label>
+                                        <input
+                                            type="number"
+                                            value={editForm.total_price}
+                                            onChange={e => setEditForm(f => ({ ...f, total_price: e.target.value }))}
+                                            placeholder="Enter agreed price..."
+                                            className="w-full border border-slate-200 rounded-xl px-3 py-2.5 text-sm font-semibold focus:outline-none focus:ring-2 focus:ring-sky-300 bg-white" />
+                                    </div>
+
+                                    {/* Deadline */}
+                                    <div>
+                                        <label className="text-xs font-semibold text-slate-500 block mb-1">Deadline</label>
+                                        <input
+                                            type="date"
+                                            value={editForm.deadline}
+                                            onChange={e => setEditForm(f => ({ ...f, deadline: e.target.value }))}
+                                            className="w-full border border-slate-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-sky-300 bg-white" />
+                                    </div>
+
+                                    {/* Custom order fields */}
+                                    {selected.type === 'custom' && (
+                                        <>
+                                            <div>
+                                                <label className="text-xs font-semibold text-slate-500 block mb-1">Description</label>
+                                                <textarea
+                                                    value={editForm.custom_description}
+                                                    onChange={e => setEditForm(f => ({ ...f, custom_description: e.target.value }))}
+                                                    rows={2}
+                                                    className="w-full border border-slate-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-sky-300 bg-white resize-none" />
+                                            </div>
+                                            <div className="grid grid-cols-2 gap-2">
+                                                <div>
+                                                    <label className="text-xs font-semibold text-slate-500 block mb-1">Dimensions</label>
+                                                    <input
+                                                        value={editForm.dimensions}
+                                                        onChange={e => setEditForm(f => ({ ...f, dimensions: e.target.value }))}
+                                                        placeholder="10×5×3 cm"
+                                                        className="w-full border border-slate-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-sky-300 bg-white" />
+                                                </div>
+                                                <div>
+                                                    <label className="text-xs font-semibold text-slate-500 block mb-1">Reference</label>
+                                                    <input
+                                                        value={editForm.reference_notes}
+                                                        onChange={e => setEditForm(f => ({ ...f, reference_notes: e.target.value }))}
+                                                        placeholder="Color, ref..."
+                                                        className="w-full border border-slate-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-sky-300 bg-white" />
+                                                </div>
+                                            </div>
+                                        </>
+                                    )}
+
+                                    {/* Notes */}
+                                    <div>
+                                        <label className="text-xs font-semibold text-slate-500 block mb-1">Internal Notes</label>
+                                        <textarea
+                                            value={editForm.notes}
+                                            onChange={e => setEditForm(f => ({ ...f, notes: e.target.value }))}
+                                            rows={2}
+                                            placeholder="Internal notes..."
+                                            className="w-full border border-slate-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-sky-300 bg-white resize-none" />
+                                    </div>
+
+                                    <div className="flex gap-2 pt-1">
+                                        <button onClick={() => setEditingOrder(false)}
+                                            className="flex-1 py-2.5 border border-slate-200 rounded-xl text-sm font-medium hover:bg-white transition-colors">
+                                            Cancel
+                                        </button>
+                                        <button onClick={saveOrderEdit} disabled={savingEdit}
+                                            className="flex-1 py-2.5 bg-sky-500 hover:bg-sky-600 disabled:opacity-50 text-white rounded-xl text-sm font-semibold transition-colors">
+                                            {savingEdit ? 'Saving...' : 'Save Changes'}
+                                        </button>
+                                    </div>
+                                </div>
+                            )}
 
                             {/* ── PIPELINE STEPPER ── */}
                             <div className="bg-slate-50 rounded-xl p-3">
@@ -1073,7 +1369,7 @@ export default function Orders() {
                                                     </span>
                                                 )}
                                                 {isFuture && !TERMINAL.includes(key) && (
-                                                    <button onClick={() => applyStatusChange(selected, key)} disabled={saving}
+                                                    <button onClick={() => handleStatusAdvance(selected, key)} disabled={saving}
                                                         className="text-xs px-2 py-1 bg-white border border-slate-200 text-slate-400 hover:border-sky-300 hover:text-sky-500 rounded-lg transition-colors">
                                                         Set
                                                     </button>
@@ -1204,6 +1500,193 @@ export default function Orders() {
                             <button onClick={() => deleteOrder(deleting.id)}
                                 className="flex-1 py-2.5 bg-red-500 hover:bg-red-600 text-white rounded-xl text-sm font-semibold">
                                 Delete
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            {/* ═══════════════════════════════════════════════════════
+                PACKAGING MODAL
+            ═══════════════════════════════════════════════════════ */}
+            {showPackagingModal && pendingDelivery && (
+                <div className="fixed inset-0 bg-black/60 z-[70] flex items-end sm:items-center justify-center p-0 sm:p-4">
+                    <div className="bg-white w-full sm:max-w-md rounded-t-3xl sm:rounded-2xl shadow-2xl max-h-[85vh] sm:max-h-[92vh] flex flex-col mb-16 sm:mb-0">
+
+                        {/* Header */}
+                        <div className="flex items-start justify-between p-5 border-b flex-shrink-0">
+                            <div>
+                                <h2 className="text-lg font-bold text-slate-800">📦 Delivery Packaging</h2>
+                                <p className="text-sm text-slate-500 mt-0.5">
+                                    Order for <span className="font-semibold text-slate-700">{pendingDelivery.clients?.name}</span>
+                                </p>
+                            </div>
+                            <button
+                                onClick={() => { setShowPackagingModal(false); setPendingDelivery(null) }}
+                                className="p-2 hover:bg-slate-100 rounded-xl transition-colors flex-shrink-0">
+                                <X size={20} />
+                            </button>
+                        </div>
+
+                        {/* Scrollable content */}
+                        <div className="flex-1 overflow-y-auto p-5 space-y-4">
+
+                            {/* Info banner */}
+                            <div className="bg-indigo-50 border border-indigo-200 rounded-xl p-3 text-xs text-indigo-700 leading-relaxed">
+                                Select materials used to package this delivery. Selected items will be automatically removed from your stock.
+                                Skip if delivering hand-to-hand with no packaging.
+                            </div>
+
+                            {/* Materials list */}
+                            {loadingPkg ? (
+                                <div className="text-center py-10 text-slate-400">Loading materials...</div>
+                            ) : packagingMaterials.length === 0 ? (
+                                <div className="text-center py-10">
+                                    <p className="text-2xl mb-2">📭</p>
+                                    <p className="text-slate-500 text-sm font-medium">No materials in stock</p>
+                                    <p className="text-slate-400 text-xs mt-1">Add materials in the Materials page first</p>
+                                </div>
+                            ) : (
+                                <div className="space-y-2">
+                                    {packagingMaterials.map(mat => {
+                                        const qty = packagingSelection[mat.id] || 0
+                                        const CAT_EMOJI = {
+                                            switches: '🔘', chains: '🔗', packaging: '🛍️',
+                                            stickers: '🏷️', hardware: '🔩', other: '📦',
+                                        }
+                                        const isSelected = qty > 0
+
+                                        return (
+                                            <div key={mat.id}
+                                                className={`flex items-center gap-3 p-3 rounded-xl border-2 transition-all
+                                ${isSelected
+                                                        ? 'border-indigo-300 bg-indigo-50'
+                                                        : 'border-slate-100 bg-white hover:border-slate-200'}`}>
+
+                                                <span className="text-2xl flex-shrink-0">{CAT_EMOJI[mat.category] || '📦'}</span>
+
+                                                <div className="flex-1 min-w-0">
+                                                    <p className="text-sm font-semibold text-slate-800 leading-tight">{mat.name}</p>
+                                                    <div className="flex items-center gap-2 mt-0.5">
+                                                        <span className="text-xs text-slate-400">
+                                                            {mat.quantity_available} in stock
+                                                        </span>
+                                                        {mat.cost_per_unit > 0 && (
+                                                            <>
+                                                                <span className="text-slate-300">·</span>
+                                                                <span className="text-xs text-slate-400">
+                                                                    {mat.cost_per_unit} TND/{mat.unit}
+                                                                </span>
+                                                            </>
+                                                        )}
+                                                    </div>
+                                                </div>
+
+                                                {/* Quantity control */}
+                                                <div className="flex items-center gap-2 flex-shrink-0">
+                                                    <button
+                                                        onClick={() => setPackagingSelection(prev => ({
+                                                            ...prev,
+                                                            [mat.id]: Math.max(0, (prev[mat.id] || 0) - 1),
+                                                        }))}
+                                                        disabled={qty === 0}
+                                                        className="w-8 h-8 rounded-full bg-slate-100 hover:bg-slate-200 disabled:opacity-30 font-bold text-slate-600 flex items-center justify-center text-lg transition-colors leading-none">
+                                                        −
+                                                    </button>
+
+                                                    <span className={`w-8 text-center text-sm font-bold transition-colors
+                                  ${isSelected ? 'text-indigo-600' : 'text-slate-400'}`}>
+                                                        {qty}
+                                                    </span>
+
+                                                    <button
+                                                        onClick={() => setPackagingSelection(prev => ({
+                                                            ...prev,
+                                                            [mat.id]: Math.min(mat.quantity_available, (prev[mat.id] || 0) + 1),
+                                                        }))}
+                                                        disabled={qty >= mat.quantity_available}
+                                                        className="w-8 h-8 rounded-full bg-slate-100 hover:bg-indigo-100 hover:text-indigo-600 disabled:opacity-30 font-bold text-slate-600 flex items-center justify-center text-lg transition-colors leading-none">
+                                                        +
+                                                    </button>
+                                                </div>
+                                            </div>
+                                        )
+                                    })}
+                                </div>
+                            )}
+
+                            {/* Packaging summary */}
+                            {Object.values(packagingSelection).some(q => q > 0) && (
+                                <div className="bg-emerald-50 border border-emerald-200 rounded-xl p-3">
+                                    <p className="text-xs font-bold text-emerald-700 uppercase tracking-wider mb-2">
+                                        Summary
+                                    </p>
+                                    <div className="space-y-1.5">
+                                        {Object.entries(packagingSelection)
+                                            .filter(([, qty]) => qty > 0)
+                                            .map(([matId, qty]) => {
+                                                const mat = packagingMaterials.find(m => m.id === matId)
+                                                if (!mat) return null
+                                                const cost = qty * (mat.cost_per_unit || 0)
+                                                return (
+                                                    <div key={matId} className="flex items-center justify-between text-xs">
+                                                        <span className="text-emerald-700">{mat.name} ×{qty}</span>
+                                                        <span className="font-semibold text-emerald-700">
+                                                            {cost > 0 ? `${cost.toFixed(2)} TND` : '—'}
+                                                        </span>
+                                                    </div>
+                                                )
+                                            })}
+
+                                        {/* Total packaging cost */}
+                                        {(() => {
+                                            const total = Object.entries(packagingSelection)
+                                                .filter(([, qty]) => qty > 0)
+                                                .reduce((sum, [matId, qty]) => {
+                                                    const mat = packagingMaterials.find(m => m.id === matId)
+                                                    return sum + (qty * (mat?.cost_per_unit || 0))
+                                                }, 0)
+                                            return total > 0 ? (
+                                                <div className="flex justify-between text-xs font-bold text-emerald-800 border-t border-emerald-200 pt-2 mt-1">
+                                                    <span>Total packaging cost</span>
+                                                    <span>{total.toFixed(2)} TND</span>
+                                                </div>
+                                            ) : null
+                                        })()}
+                                    </div>
+                                </div>
+                            )}
+                        </div>
+
+                        {/* Action buttons — fixed at bottom */}
+                        <div className="p-5 border-t bg-white flex-shrink-0 space-y-2 rounded-b-3xl sm:rounded-b-2xl">
+                            <button
+                                onClick={() => confirmDelivery(false)}
+                                disabled={confirmingPkg}
+                                className="w-full py-3.5 bg-indigo-500 hover:bg-indigo-600 disabled:opacity-50 text-white rounded-xl font-bold text-sm transition-colors flex items-center justify-center gap-2 shadow-sm">
+                                {confirmingPkg
+                                    ? 'Delivering...'
+                                    : Object.values(packagingSelection).some(q => q > 0)
+                                        ? `🚚 Confirm Delivery with Packaging`
+                                        : `🚚 Confirm Delivery`}
+                            </button>
+
+                            <button
+                                onClick={() => confirmDelivery(true)}
+                                disabled={confirmingPkg}
+                                className="w-full py-2.5 border border-slate-200 hover:bg-slate-50 text-slate-500 rounded-xl text-sm font-medium transition-colors">
+                                🤝 Hand-to-hand — No packaging
+                            </button>
+
+                            <button
+                                onClick={() => {
+                                    setShowPackagingModal(false)
+                                    setPendingDelivery(null)
+                                    setPackagingSelection({})
+                                }}
+                                disabled={confirmingPkg}
+                                className="w-full py-2 text-xs text-slate-400 hover:text-slate-600 transition-colors">
+                                Cancel
                             </button>
                         </div>
                     </div>
