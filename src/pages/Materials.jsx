@@ -3,10 +3,10 @@ import { supabase } from '../lib/supabase'
 import { Plus, X, Trash2, Pencil, History, Wrench } from 'lucide-react'
 
 const CATEGORIES = [
-    { key: 'switches', label: 'Keyboard Switches', emoji: '🔘' },
-    { key: 'chains', label: 'Keychain Chains', emoji: '🔗' },
+    { key: 'crafting', label: 'Crafting stuff', emoji: '🔘' },
+    { key: 'marketing', label: 'Marketing', emoji: '🔗' },
     { key: 'packaging', label: 'Packaging / Bags', emoji: '🛍️' },
-    { key: 'stickers', label: 'Stickers / Labels', emoji: '🏷️' },
+    { key: 'Impression', label: 'Stickers / Labels', emoji: '🏷️' },
     { key: 'hardware', label: 'Hardware / Screws', emoji: '🔩' },
     { key: 'other', label: 'Other', emoji: '📦' },
 ]
@@ -19,7 +19,7 @@ const MANUAL_TYPES = [
     { key: 'lost', label: 'Lost', emoji: '❓', sign: -1, desc: 'Missing stock' },
 ]
 
-const emptyMat = { name: '', category: 'switches', unit: 'unit', cost_per_unit: '', low_stock_threshold: 5, notes: '' }
+const emptyMat = { name: '', category: 'crafting', unit: 'unit', cost_per_unit: '', low_stock_threshold: 5, notes: '' }
 const emptyMove = { material_id: '', type: 'purchased', quantity: 1, notes: '' }
 
 export default function Materials() {

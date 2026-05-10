@@ -27,7 +27,7 @@ export default function Layout() {
             {/* Sidebar — desktop */}
             <aside className="hidden md:flex flex-col w-56 bg-slate-900 text-white py-6 px-3 gap-1 overflow-y-auto">
                 <div className="px-3 mb-6 flex items-center gap-2">
-                    <img src={Logo} alt="Next Layer" className="w-8 h-8 object-contain" />
+                    <img src={Logo} alt="Next Layer" className="w-16 h-16 object-contain" />
                     <div>
                         <h1 className="text-sm font-bold text-sky-400 leading-tight">Next Layer</h1>
                         <p className="text-xs text-slate-400 leading-tight">Business Dashboard</p>
