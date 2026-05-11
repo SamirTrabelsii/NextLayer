@@ -89,13 +89,17 @@ export default function Orders() {
     const [financials, setFinancials] = useState(null)
     const [loadingFin, setLoadingFin] = useState(false)
 
+    const [showProductionModal, setShowProductionModal] = useState(false)
+    const [pendingReady, setPendingReady] = useState(null)
+    const [productionForm, setProductionForm] = useState({ price: '', filament_grams: '', print_time_hours: '', actual_cost: '' })
+    const [productionFormError, setProductionFormError] = useState('')
+    const [savingProduction, setSavingProduction] = useState(false)
+
     async function fetchOrderFinancials(order) {
         setLoadingFin(true)
         setFinancials(null)
         try {
-            const revenue = parseFloat(order.total_price) || 0
-
-            // Packaging used at delivery (same for both types)
+            // Packaging used at delivery — same for both types
             const { data: packagingMoves } = await supabase
                 .from('material_movements')
                 .select('quantity, materials(name, cost_per_unit)')
@@ -107,78 +111,79 @@ export default function Orders() {
                 .map(m => ({
                     name: m.materials?.name || '?',
                     qty: m.quantity,
-                    cost: (m.quantity * (m.materials?.cost_per_unit || 0)),
+                    cost: m.quantity * (m.materials?.cost_per_unit || 0),
                 }))
             const packagingCost = packagingLines.reduce((s, l) => s + l.cost, 0)
 
             let costBreakdown = []
             let totalCost = 0
+            let revenue = 0
 
-            // ── CUSTOM ORDER: cost comes from production ──────────────
+            // ── CUSTOM ORDER ─────────────────────────────────────────
             if (order.type === 'custom') {
+                revenue = parseFloat(order.total_price) || 0
+
                 const { data: productions } = await supabase
                     .from('productions')
-                    .select('actual_cost, filament_grams, print_time_hours, description')
+                    .select('actual_cost, filament_grams, print_time_hours')
                     .eq('order_id', order.id)
 
                 const prods = productions || []
                 const productionCost = prods.reduce((s, p) => s + (parseFloat(p.actual_cost) || 0), 0)
 
-                if (prods.length > 0) {
+                if (productionCost > 0) {
+                    const p = prods[0]
                     costBreakdown.push({
-                        label: prods.length === 1
-                            ? 'Print job (filament + electricity)'
-                            : `${prods.length} print jobs`,
+                        label: 'Production',
                         amount: productionCost,
-                        sub: prods.length === 1 && prods[0].filament_grams
-                            ? `${prods[0].filament_grams}g filament · ${prods[0].print_time_hours || '?'}h`
-                            : null,
+                        sub: [
+                            p?.filament_grams ? `${p.filament_grams}g filament` : null,
+                            p?.print_time_hours ? `${p.print_time_hours}h print time` : null,
+                        ].filter(Boolean).join(' · ') || null,
                     })
-                } else {
-                    costBreakdown.push({
-                        label: 'Print job',
-                        amount: 0,
-                        sub: 'No production logged yet',
-                    })
+                    totalCost = productionCost + packagingCost
                 }
-
-                totalCost = productionCost + packagingCost
+                // No production cost → totalCost stays 0 → no financial breakdown shown
             }
 
-            // ── STANDARD ORDER: cost comes from catalogue prices ──────
+            // ── STANDARD ORDER ───────────────────────────────────────
             else {
                 const { data: orderItems } = await supabase
                     .from('order_items')
                     .select('quantity, unit_price, product_id, products(id, name, production_cost)')
                     .eq('order_id', order.id)
 
-                const items = (orderItems || [])
+                const itemsList = orderItems || []
 
-                for (const item of items) {
+                // Revenue = sum of actual selling prices × quantities
+                revenue = itemsList.reduce((s, item) =>
+                    s + ((parseFloat(item.unit_price) || 0) * (parseInt(item.quantity) || 1)), 0)
+
+                // Cost = only items that have production_cost set in catalogue
+                let itemsCost = 0
+                for (const item of itemsList) {
                     const qty = parseInt(item.quantity) || 1
                     const unitCost = parseFloat(item.products?.production_cost) || 0
-                    const totalItem = unitCost * qty
-                    const sellingLine = parseFloat(item.unit_price) || 0
 
-                    costBreakdown.push({
-                        label: item.products?.name || 'Custom item',
-                        amount: totalItem,
-                        sub: unitCost > 0
-                            ? `${unitCost.toFixed(2)} TND/unit × ${qty}`
-                            : 'No cost set in catalogue',
-                        selling: sellingLine * qty,
-                    })
+                    if (unitCost > 0) {
+                        itemsCost += unitCost * qty
+                        costBreakdown.push({
+                            label: item.products?.name || 'Item',
+                            amount: unitCost * qty,
+                            sub: `${unitCost.toFixed(2)} TND/unit × ${qty}`,
+                        })
+                    }
+                    // Product with no cost → ignored, not shown
                 }
 
-                totalCost = items.reduce((s, item) => {
-                    const qty = parseInt(item.quantity) || 1
-                    const unitCost = parseFloat(item.products?.production_cost) || 0
-                    return s + (unitCost * qty)
-                }, 0) + packagingCost
+                if (itemsCost > 0) {
+                    totalCost = itemsCost + packagingCost
+                }
+                // If no items have cost set → totalCost = 0 → no breakdown shown
             }
 
-            // Add packaging to breakdown if used
-            if (packagingLines.length > 0) {
+            // Packaging line (only if cost exists)
+            if (packagingLines.length > 0 && totalCost > 0) {
                 costBreakdown.push({
                     label: 'Packaging',
                     amount: packagingCost,
@@ -186,13 +191,14 @@ export default function Orders() {
                 })
             }
 
-            const profit = revenue - totalCost
-            const margin = revenue > 0 ? (profit / revenue) * 100 : null
+            const hasBoth = revenue > 0 && totalCost > 0
+            const profit = hasBoth ? revenue - totalCost : null
+            const margin = profit !== null ? (profit / revenue) * 100 : null
 
             setFinancials({
-                revenue,
+                revenue: parseFloat(revenue.toFixed(2)),
                 totalCost: parseFloat(totalCost.toFixed(2)),
-                profit: parseFloat(profit.toFixed(2)),
+                profit: profit !== null ? parseFloat(profit.toFixed(2)) : null,
                 margin: margin !== null ? parseFloat(margin.toFixed(1)) : null,
                 costBreakdown,
                 hasRevenue: revenue > 0,
@@ -508,6 +514,92 @@ export default function Orders() {
         setShowPackagingModal(true)
     }
 
+    async function initProductionDetails(order) {
+        // Pre-fill with existing production data if any
+        const { data: prod } = await supabase
+            .from('productions')
+            .select('filament_grams, print_time_hours, actual_cost')
+            .eq('order_id', order.id)
+            .maybeSingle()
+
+        setProductionForm({
+            price: order.total_price ? String(order.total_price) : '',
+            filament_grams: prod?.filament_grams ? String(prod.filament_grams) : '',
+            print_time_hours: prod?.print_time_hours ? String(prod.print_time_hours) : '',
+            actual_cost: prod?.actual_cost ? String(prod.actual_cost) : '',
+        })
+        setProductionFormError('')
+        setPendingReady(order)
+        setShowProductionModal(true)
+    }
+
+    async function confirmProductionDetails() {
+        if (!pendingReady) return
+
+        // Price is required if not already set
+        const hasPrice = pendingReady.total_price || parseFloat(productionForm.price) > 0
+        if (!hasPrice) {
+            setProductionFormError('Price is required to finalize this order.')
+            return
+        }
+
+        setSavingProduction(true)
+        setProductionFormError('')
+        try {
+            const newPrice = parseFloat(productionForm.price) || null
+            const filament = parseFloat(productionForm.filament_grams) || null
+            const hours = parseFloat(productionForm.print_time_hours) || null
+            const actualCost = parseFloat(productionForm.actual_cost) || null
+
+            // 1. Update order price if user entered one
+            if (newPrice && newPrice !== parseFloat(pendingReady.total_price)) {
+                await supabase.from('orders')
+                    .update({ total_price: newPrice })
+                    .eq('id', pendingReady.id)
+            }
+
+            // 2. Update linked production with details
+            const { data: prod } = await supabase
+                .from('productions')
+                .select('id')
+                .eq('order_id', pendingReady.id)
+                .maybeSingle()
+
+            if (prod) {
+                await supabase.from('productions').update({
+                    filament_grams: filament,
+                    print_time_hours: hours,
+                    actual_cost: actualCost,
+                    status: 'done',
+                }).eq('id', prod.id)
+            }
+
+            // 3. Update selected panel state if it's open
+            if (selected?.id === pendingReady.id) {
+                setSelected(prev => ({
+                    ...prev,
+                    total_price: newPrice ?? prev.total_price,
+                }))
+            }
+
+            setShowProductionModal(false)
+
+            // 4. Advance order to ready
+            const orderWithUpdatedPrice = {
+                ...pendingReady,
+                total_price: newPrice ?? pendingReady.total_price,
+            }
+            await applyStatusChange(orderWithUpdatedPrice, 'ready')
+            setPendingReady(null)
+
+        } catch (err) {
+            console.error(err)
+            setProductionFormError('Something went wrong. Please try again.')
+        } finally {
+            setSavingProduction(false)
+        }
+    }
+
     // ── Confirm delivery: consume packaging then advance order ────
     async function confirmDelivery(skipPackaging = false) {
         if (!pendingDelivery) return
@@ -556,11 +648,12 @@ export default function Orders() {
     function handleStatusAdvance(order, targetStatus) {
         if (targetStatus === 'delivered') {
             initDelivery(order)
+        } else if (targetStatus === 'ready' && order.type === 'custom') {
+            initProductionDetails(order)   // intercept for custom orders
         } else {
             applyStatusChange(order, targetStatus)
         }
     }
-
     // ─── SAVE ORDER ───────────────────────────────────────────────
     async function saveOrder() {
         if (!form.client_id) return
@@ -1912,6 +2005,191 @@ export default function Orders() {
                             <button onClick={() => deleteOrder(deleting.id)}
                                 className="flex-1 py-2.5 bg-red-500 hover:bg-red-600 text-white rounded-xl text-sm font-semibold">
                                 Delete
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            {/* ═══════════════════════════════════════════════════════
+                CUSTOM ORDER — PRODUCTION DETAILS MODAL
+                Shown when moving custom order to "Ready"
+            ═══════════════════════════════════════════════════════ */}
+            {showProductionModal && pendingReady && (
+                <div className="fixed inset-0 bg-black/60 z-[70] flex items-end sm:items-center justify-center p-0 sm:p-4">
+                    <div className="bg-white w-full sm:max-w-md rounded-t-3xl sm:rounded-2xl shadow-2xl
+                        max-h-[85vh] sm:max-h-[92vh] flex flex-col mb-16 sm:mb-0">
+
+                        {/* Header */}
+                        <div className="flex items-start justify-between p-5 border-b flex-shrink-0">
+                            <div>
+                                <h2 className="text-lg font-bold text-slate-800">✅ Mark as Ready</h2>
+                                <p className="text-sm text-slate-500 mt-0.5">
+                                    {pendingReady.clients?.name}
+                                    {pendingReady.custom_description &&
+                                        <span className="text-slate-400"> — {pendingReady.custom_description}</span>}
+                                </p>
+                            </div>
+                            <button
+                                onClick={() => { setShowProductionModal(false); setPendingReady(null) }}
+                                className="p-2 hover:bg-slate-100 rounded-xl flex-shrink-0">
+                                <X size={20} />
+                            </button>
+                        </div>
+
+                        <div className="flex-1 overflow-y-auto p-5 space-y-5">
+
+                            {/* Price — required if not set */}
+                            <div>
+                                <div className="flex items-center gap-2 mb-1.5">
+                                    <label className="text-sm font-bold text-slate-700">
+                                        Final Price (TND)
+                                    </label>
+                                    {!pendingReady.total_price && (
+                                        <span className="text-xs bg-red-100 text-red-600 px-2 py-0.5 rounded-full font-semibold">
+                                            Required
+                                        </span>
+                                    )}
+                                    {pendingReady.total_price && (
+                                        <span className="text-xs bg-emerald-100 text-emerald-600 px-2 py-0.5 rounded-full">
+                                            Already set: {pendingReady.total_price} TND
+                                        </span>
+                                    )}
+                                </div>
+                                <input
+                                    type="number"
+                                    value={productionForm.price}
+                                    onChange={e => setProductionForm(f => ({ ...f, price: e.target.value }))}
+                                    placeholder={pendingReady.total_price
+                                        ? `Current: ${pendingReady.total_price} TND`
+                                        : 'Enter the agreed price...'}
+                                    className={`w-full border-2 rounded-xl px-3 py-3 text-lg font-bold focus:outline-none transition-colors
+                                        ${!pendingReady.total_price && !productionForm.price
+                                            ? 'border-red-300 focus:border-red-400 bg-red-50'
+                                            : 'border-slate-200 focus:border-sky-400 bg-white'}`} />
+                                <p className="text-xs text-slate-400 mt-1">
+                                    This is what the client will pay. Leave empty to keep the current price.
+                                </p>
+                            </div>
+
+                            {/* Divider */}
+                            <div className="flex items-center gap-3">
+                                <div className="flex-1 h-px bg-slate-200" />
+                                <span className="text-xs text-slate-400 font-medium">Production details (optional)</span>
+                                <div className="flex-1 h-px bg-slate-200" />
+                            </div>
+
+                            {/* Filament + Print time */}
+                            <div className="grid grid-cols-2 gap-3">
+                                <div>
+                                    <label className="text-sm font-medium text-slate-600 block mb-1.5">
+                                        🧵 Filament used (g)
+                                    </label>
+                                    <input
+                                        type="number"
+                                        value={productionForm.filament_grams}
+                                        onChange={e => {
+                                            const val = e.target.value
+                                            setProductionForm(prev => {
+                                                const grams = parseFloat(val) || 0
+                                                const hours = parseFloat(prev.print_time_hours) || 0
+                                                const cost = (grams / 1000 * 35) + (hours * 0.15)
+                                                return {
+                                                    ...prev,
+                                                    filament_grams: val,
+                                                    actual_cost: cost > 0 ? cost.toFixed(2) : '',
+                                                }
+                                            })
+                                        }}
+                                        placeholder="e.g. 85"
+                                        className="w-full border border-slate-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-sky-300" />
+                                </div>
+                                <div>
+                                    <label className="text-sm font-medium text-slate-600 block mb-1.5">
+                                        ⏱️ Print time (h)
+                                    </label>
+                                    <input
+                                        type="number"
+                                        value={productionForm.print_time_hours}
+                                        onChange={e => {
+                                            const val = e.target.value
+                                            setProductionForm(prev => {
+                                                const grams = parseFloat(prev.filament_grams) || 0
+                                                const hours = parseFloat(val) || 0
+                                                const cost = (grams / 1000 * 35) + (hours * 0.15)
+                                                return {
+                                                    ...prev,
+                                                    print_time_hours: val,
+                                                    actual_cost: cost > 0 ? cost.toFixed(2) : '',
+                                                }
+                                            })
+                                        }}
+                                        placeholder="e.g. 3.5"
+                                        className="w-full border border-slate-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-sky-300" />
+                                </div>
+                            </div>
+
+                            {/* Auto-calculated cost */}
+                            {productionForm.actual_cost && (
+                                <div className="bg-sky-50 border border-sky-200 rounded-xl px-4 py-3 flex items-center justify-between">
+                                    <span className="text-sm text-sky-700 font-medium">
+                                        🖨️ Calculated production cost
+                                    </span>
+                                    <span className="text-base font-bold text-sky-700">
+                                        {productionForm.actual_cost} TND
+                                    </span>
+                                </div>
+                            )}
+
+                            {/* Margin preview */}
+                            {productionForm.actual_cost && (productionForm.price || pendingReady.total_price) && (() => {
+                                const price = parseFloat(productionForm.price) || parseFloat(pendingReady.total_price) || 0
+                                const cost = parseFloat(productionForm.actual_cost) || 0
+                                const profit = price - cost
+                                const margin = price > 0 ? (profit / price * 100) : 0
+                                if (price <= 0) return null
+                                return (
+                                    <div className={`rounded-xl px-4 py-3 flex items-center justify-between
+                                        ${profit >= 0 ? 'bg-emerald-50 border border-emerald-200' : 'bg-red-50 border border-red-200'}`}>
+                                        <div>
+                                            <p className={`text-xs font-semibold ${profit >= 0 ? 'text-emerald-600' : 'text-red-600'}`}>
+                                                {profit >= 0 ? '✅ Profitable' : '⚠️ Loss'}
+                                            </p>
+                                            <p className="text-xs text-slate-400">Based on production cost only</p>
+                                        </div>
+                                        <div className="text-right">
+                                            <p className={`text-base font-bold ${profit >= 0 ? 'text-emerald-700' : 'text-red-600'}`}>
+                                                {profit >= 0 ? '+' : ''}{profit.toFixed(2)} TND
+                                            </p>
+                                            <p className={`text-xs font-semibold ${profit >= 0 ? 'text-emerald-500' : 'text-red-400'}`}>
+                                                {margin.toFixed(1)}% margin
+                                            </p>
+                                        </div>
+                                    </div>
+                                )
+                            })()}
+
+                            {/* Form error */}
+                            {productionFormError && (
+                                <div className="bg-red-50 border border-red-200 rounded-xl p-3 text-sm text-red-600 font-medium">
+                                    ⚠️ {productionFormError}
+                                </div>
+                            )}
+                        </div>
+
+                        {/* Actions */}
+                        <div className="p-5 border-t bg-white flex-shrink-0 space-y-2 rounded-b-3xl sm:rounded-b-2xl">
+                            <button
+                                onClick={confirmProductionDetails}
+                                disabled={savingProduction}
+                                className="w-full py-3.5 bg-orange-500 hover:bg-orange-600 disabled:opacity-50 text-white rounded-xl font-bold text-sm transition-colors flex items-center justify-center gap-2 shadow-sm">
+                                {savingProduction ? 'Saving...' : '📦 Confirm — Mark as Ready'}
+                            </button>
+                            <button
+                                onClick={() => { setShowProductionModal(false); setPendingReady(null) }}
+                                disabled={savingProduction}
+                                className="w-full py-2.5 border border-slate-200 text-slate-500 hover:bg-slate-50 rounded-xl text-sm font-medium transition-colors">
+                                Cancel
                             </button>
                         </div>
                     </div>
