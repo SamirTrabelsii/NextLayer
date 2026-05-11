@@ -86,6 +86,232 @@ export default function Orders() {
     const [packagingSelection, setPackagingSelection] = useState({}) // { material_id: quantity }
     const [loadingPkg, setLoadingPkg] = useState(false)
     const [confirmingPkg, setConfirmingPkg] = useState(false)
+    const [financials, setFinancials] = useState(null)
+    const [loadingFin, setLoadingFin] = useState(false)
+
+    async function fetchOrderFinancials(order) {
+        setLoadingFin(true)
+        setFinancials(null)
+        try {
+            const revenue = parseFloat(order.total_price) || 0
+
+            // Packaging used at delivery (same for both types)
+            const { data: packagingMoves } = await supabase
+                .from('material_movements')
+                .select('quantity, materials(name, cost_per_unit)')
+                .eq('order_id', order.id)
+                .eq('type', 'used')
+
+            const packagingLines = (packagingMoves || [])
+                .filter(m => m.quantity > 0)
+                .map(m => ({
+                    name: m.materials?.name || '?',
+                    qty: m.quantity,
+                    cost: (m.quantity * (m.materials?.cost_per_unit || 0)),
+                }))
+            const packagingCost = packagingLines.reduce((s, l) => s + l.cost, 0)
+
+            let costBreakdown = []
+            let totalCost = 0
+
+            // ── CUSTOM ORDER: cost comes from production ──────────────
+            if (order.type === 'custom') {
+                const { data: productions } = await supabase
+                    .from('productions')
+                    .select('actual_cost, filament_grams, print_time_hours, description')
+                    .eq('order_id', order.id)
+
+                const prods = productions || []
+                const productionCost = prods.reduce((s, p) => s + (parseFloat(p.actual_cost) || 0), 0)
+
+                if (prods.length > 0) {
+                    costBreakdown.push({
+                        label: prods.length === 1
+                            ? 'Print job (filament + electricity)'
+                            : `${prods.length} print jobs`,
+                        amount: productionCost,
+                        sub: prods.length === 1 && prods[0].filament_grams
+                            ? `${prods[0].filament_grams}g filament · ${prods[0].print_time_hours || '?'}h`
+                            : null,
+                    })
+                } else {
+                    costBreakdown.push({
+                        label: 'Print job',
+                        amount: 0,
+                        sub: 'No production logged yet',
+                    })
+                }
+
+                totalCost = productionCost + packagingCost
+            }
+
+            // ── STANDARD ORDER: cost comes from catalogue prices ──────
+            else {
+                const { data: orderItems } = await supabase
+                    .from('order_items')
+                    .select('quantity, unit_price, product_id, products(id, name, production_cost)')
+                    .eq('order_id', order.id)
+
+                const items = (orderItems || [])
+
+                for (const item of items) {
+                    const qty = parseInt(item.quantity) || 1
+                    const unitCost = parseFloat(item.products?.production_cost) || 0
+                    const totalItem = unitCost * qty
+                    const sellingLine = parseFloat(item.unit_price) || 0
+
+                    costBreakdown.push({
+                        label: item.products?.name || 'Custom item',
+                        amount: totalItem,
+                        sub: unitCost > 0
+                            ? `${unitCost.toFixed(2)} TND/unit × ${qty}`
+                            : 'No cost set in catalogue',
+                        selling: sellingLine * qty,
+                    })
+                }
+
+                totalCost = items.reduce((s, item) => {
+                    const qty = parseInt(item.quantity) || 1
+                    const unitCost = parseFloat(item.products?.production_cost) || 0
+                    return s + (unitCost * qty)
+                }, 0) + packagingCost
+            }
+
+            // Add packaging to breakdown if used
+            if (packagingLines.length > 0) {
+                costBreakdown.push({
+                    label: 'Packaging',
+                    amount: packagingCost,
+                    sub: packagingLines.map(l => `${l.name} ×${l.qty}`).join(', '),
+                })
+            }
+
+            const profit = revenue - totalCost
+            const margin = revenue > 0 ? (profit / revenue) * 100 : null
+
+            setFinancials({
+                revenue,
+                totalCost: parseFloat(totalCost.toFixed(2)),
+                profit: parseFloat(profit.toFixed(2)),
+                margin: margin !== null ? parseFloat(margin.toFixed(1)) : null,
+                costBreakdown,
+                hasRevenue: revenue > 0,
+                hasCost: totalCost > 0,
+                type: order.type,
+            })
+
+        } catch (err) {
+            console.error('Financials error:', err)
+            setFinancials({ error: true })
+        } finally {
+            setLoadingFin(false)
+        }
+    }
+
+    // Accepts explicit order OR falls back to selected panel
+    async function fulfillRestockedOrder(targetOrder = null) {
+        const order = targetOrder || selected
+        if (!order) return
+
+        setSaving(true)
+        setError('')
+
+        try {
+            // Always fetch items fresh — never trust cached state
+            const { data: orderItems, error: err1 } = await supabase
+                .from('order_items')
+                .select('id, product_id, quantity, products(id, name)')
+                .eq('order_id', order.id)
+
+            if (err1) throw new Error('Failed to load order items.')
+
+            const productItems = (orderItems || []).filter(i => i.product_id)
+
+            // Hard block — never silently advance without verification
+            if (productItems.length === 0) {
+                setError(
+                    'No catalogue products found for this order.\n' +
+                    'Items may not have been saved correctly when the order was created.\n' +
+                    'Please delete this order and recreate it.'
+                )
+                return
+            }
+
+            // Check ALL products before touching anything
+            const problems = []
+            const verified = []
+
+            for (const item of productItems) {
+                const needed = parseInt(item.quantity) || 1
+
+                const { data: stockRow } = await supabase
+                    .from('stock')
+                    .select('id, quantity_available')
+                    .eq('product_id', item.product_id)
+                    .maybeSingle()
+
+                const available = stockRow?.quantity_available ?? 0
+
+                if (!stockRow || available < needed) {
+                    problems.push({
+                        name: item.products?.name || 'Unknown product',
+                        needed,
+                        available,
+                        missing: Math.max(0, needed - available),
+                    })
+                } else {
+                    verified.push({ item, stockRow, needed })
+                }
+            }
+
+            // If ANY product still lacks stock → show exactly what's missing
+            if (problems.length > 0) {
+                const detail = problems
+                    .map(p => `• ${p.name}: need ${p.needed}, have ${p.available} (add ${p.missing} more)`)
+                    .join('\n')
+                setError(`Not enough stock yet:\n${detail}`)
+                return
+            }
+
+            // All verified — reduce stock
+            for (const { item, stockRow, needed } of verified) {
+                await supabase.from('stock').update({
+                    quantity_available: stockRow.quantity_available - needed,
+                    updated_at: new Date().toISOString(),
+                }).eq('id', stockRow.id)
+
+                await supabase.from('stock_movements').insert([{
+                    product_id: item.product_id,
+                    type: 'sold',
+                    quantity: needed,
+                    is_positive: false,
+                    order_id: order.id,
+                    notes: `Restocked & fulfilled — ${order.clients?.name || ''}`,
+                }])
+            }
+
+            // Advance order
+            const { error: err2 } = await supabase
+                .from('orders')
+                .update({ status: 'ready' })
+                .eq('id', order.id)
+
+            if (err2) throw new Error(err2.message)
+
+            // Update panel if open
+            if (selected?.id === order.id) {
+                setSelected(prev => ({ ...prev, status: 'ready' }))
+            }
+            await fetchAll()
+
+        } catch (err) {
+            console.error(err)
+            setError(err.message || 'Something went wrong.')
+        } finally {
+            setSaving(false)
+        }
+    }
+
     // ─── DATA FETCHING ──────────────────────────────────────────
     const fetchAll = useCallback(async () => {
         setLoading(true)
@@ -156,7 +382,12 @@ export default function Orders() {
         setError('')
     }
 
-    function closeDetail() { setSelected(null) }
+    function closeDetail() {
+        setSelected(null)
+        setFinancials(null)
+        setError('')
+        setEditingOrder(false)
+    }
 
     // ─── INLINE CLIENT CREATE ────────────────────────────────────
     async function createClientInline() {
@@ -344,16 +575,18 @@ export default function Orders() {
 
             if (form.type === 'standard') {
                 finalPrice = calcTotal(validItems) || null
-
                 const hasProducts = validItems.some(i => i.product_id)
+
                 if (hasProducts) {
-                    // Pre-check availability (read-only, fast)
+                    // Check availability to decide initial status
                     let canFulfill = true
                     for (const item of validItems.filter(i => i.product_id)) {
                         const qty = parseInt(item.quantity) || 1
                         const { data: stockRow } = await supabase
-                            .from('stock').select('quantity_available')
-                            .eq('product_id', item.product_id).single()
+                            .from('stock')
+                            .select('quantity_available')
+                            .eq('product_id', item.product_id)
+                            .maybeSingle()
                         if ((stockRow?.quantity_available ?? 0) < qty) {
                             canFulfill = false
                             break
@@ -384,26 +617,64 @@ export default function Orders() {
 
             if (orderErr) throw orderErr
 
-            // Save order items for standard orders
+            // ── ALWAYS save order items for standard orders ──────────
+            // This must happen regardless of stock status
+            if (form.type === 'standard' && validItems.length > 0) {
+                const { error: itemsErr } = await supabase
+                    .from('order_items')
+                    .insert(
+                        validItems.map(i => ({
+                            order_id: order.id,
+                            product_id: i.product_id || null,
+                            custom_description: i.custom_description || null,
+                            quantity: parseInt(i.quantity) || 1,
+                            unit_price: parseFloat(i.unit_price) || null,
+                        }))
+                    )
+                if (itemsErr) throw itemsErr
+            }
+
+            // ── Reduce stock only if order is immediately ready ──────
             if (form.type === 'standard' && initialStatus === 'ready') {
-                const { allOk, results } = await reduceStockAtomic(
-                    validItems, order.id, client?.name || ''
-                )
-                if (!allOk) {
-                    // Stock changed between check and reduction — mark as waiting_restock
-                    await supabase.from('orders')
-                        .update({ status: 'waiting_restock' })
-                        .eq('id', order.id)
+                for (const item of validItems.filter(i => i.product_id)) {
+                    const qty = parseInt(item.quantity) || 1
+                    const { data: stockRow } = await supabase
+                        .from('stock')
+                        .select('id, quantity_available')
+                        .eq('product_id', item.product_id)
+                        .maybeSingle()
+
+                    if (stockRow && stockRow.quantity_available >= qty) {
+                        await supabase.from('stock').update({
+                            quantity_available: stockRow.quantity_available - qty,
+                            updated_at: new Date().toISOString(),
+                        }).eq('id', stockRow.id)
+
+                        await supabase.from('stock_movements').insert([{
+                            product_id: item.product_id,
+                            type: 'sold',
+                            quantity: qty,
+                            is_positive: false,
+                            order_id: order.id,
+                            notes: `Sold — ${client?.name || ''}`,
+                        }])
+                    } else {
+                        // Race condition: stock disappeared — flip to waiting_restock
+                        await supabase.from('orders')
+                            .update({ status: 'waiting_restock' })
+                            .eq('id', order.id)
+                    }
                 }
             }
 
-            // Auto-create production for custom orders
+            // ── Auto-create production for custom orders ─────────────
             if (form.type === 'custom') {
                 await autoCreateProduction(order)
             }
 
             closeModal()
             await fetchAll()
+
         } catch (err) {
             console.error('Save order error:', err)
             setError('Something went wrong. Please try again.')
@@ -411,7 +682,6 @@ export default function Orders() {
             setSaving(false)
         }
     }
-
     async function saveOrderEdit() {
         if (!selected) return
         setSavingEdit(true)
@@ -464,41 +734,57 @@ export default function Orders() {
             // Must verify stock is available now, then reduce it
             if (order.status === 'waiting_restock' && next === 'ready') {
 
-                // 1. Fetch order items fresh from DB
-                const { data: orderItems, error: itemsErr } = await supabase
+                // Always fetch fresh order items directly from DB — never trust stale state
+                const { data: rawItems, error: fetchErr } = await supabase
                     .from('order_items')
-                    .select('*, products(name)')
+                    .select('id, product_id, quantity, products(id, name)')
                     .eq('order_id', order.id)
 
-                if (itemsErr) throw new Error('Could not load order items.')
+                if (fetchErr) throw new Error('Could not load order items.')
 
-                const productItems = (orderItems || []).filter(i => i.product_id)
+                const productItems = (rawItems || []).filter(i => i.product_id)
 
                 if (productItems.length === 0) {
-                    // No catalogue products in order — just advance
+                    setError('No items found for this order. Cannot verify stock.')
+                    setSaving(false)
+                    return
                 } else {
-                    // 2. Check every product has enough stock
+
+                    // ── PASS 1: Check ALL items before touching anything ──────
+                    const problems = []
+
                     for (const item of productItems) {
                         const needed = parseInt(item.quantity) || 1
+
                         const { data: stockRow } = await supabase
                             .from('stock')
                             .select('quantity_available')
                             .eq('product_id', item.product_id)
-                            .single()
+                            .maybeSingle()
 
                         const available = stockRow?.quantity_available ?? 0
 
                         if (available < needed) {
-                            setError(
-                                `Still not enough stock for "${item.products?.name || 'product'}". ` +
-                                `Need ${needed}, only ${available} available. Add more stock first.`
-                            )
-                            setSaving(false)
-                            return
+                            problems.push({
+                                name: item.products?.name || 'Unknown product',
+                                needed,
+                                available,
+                                missing: needed - available,
+                            })
                         }
                     }
 
-                    // 3. All good — reduce stock for each item
+                    // If ANY item fails → stop entirely, show exactly what's missing
+                    if (problems.length > 0) {
+                        const lines = problems.map(p =>
+                            `• ${p.name}: need ${p.needed}, have ${p.available} (${p.missing} missing)`
+                        ).join('\n')
+                        setError(`Cannot fulfill — not enough stock:\n${lines}`)
+                        setSaving(false)
+                        return
+                    }
+
+                    // ── PASS 2: All checks passed → reduce stock atomically ───
                     for (const item of productItems) {
                         const qty = parseInt(item.quantity) || 1
 
@@ -506,23 +792,30 @@ export default function Orders() {
                             .from('stock')
                             .select('id, quantity_available')
                             .eq('product_id', item.product_id)
-                            .single()
+                            .maybeSingle()
 
-                        if (stockRow) {
-                            await supabase.from('stock').update({
-                                quantity_available: Math.max(0, stockRow.quantity_available - qty),
-                                updated_at: new Date().toISOString(),
-                            }).eq('id', stockRow.id)
+                        if (!stockRow) continue
 
-                            await supabase.from('stock_movements').insert([{
-                                product_id: item.product_id,
-                                type: 'sold',
-                                quantity: qty,
-                                is_positive: false,
-                                order_id: order.id,
-                                notes: `Restocked & fulfilled — ${order.clients?.name || ''}`,
-                            }])
+                        // Final safety check in case stock changed between Pass 1 and 2
+                        if (stockRow.quantity_available < qty) {
+                            setError(`Stock changed during update. Please try again.`)
+                            setSaving(false)
+                            return
                         }
+
+                        await supabase.from('stock').update({
+                            quantity_available: stockRow.quantity_available - qty,
+                            updated_at: new Date().toISOString(),
+                        }).eq('id', stockRow.id)
+
+                        await supabase.from('stock_movements').insert([{
+                            product_id: item.product_id,
+                            type: 'sold',
+                            quantity: qty,
+                            is_positive: false,
+                            order_id: order.id,
+                            notes: `Restocked & fulfilled — ${order.clients?.name || ''}`,
+                        }])
                     }
                 }
             }
@@ -713,7 +1006,12 @@ export default function Orders() {
                                 className="bg-white rounded-2xl border border-slate-100 shadow-sm hover:shadow-md transition-shadow">
 
                                 {/* Card body — click to open detail */}
-                                <div className="p-4 cursor-pointer" onClick={() => setSelected(o)}>
+                                <div className="p-4 cursor-pointer" onClick={() => {
+                                    setSelected(o)
+                                    setError('')
+                                    setEditingOrder(false)
+                                    fetchOrderFinancials(o)
+                                }}>
                                     <div className="flex items-start justify-between gap-3">
                                         <div className="flex-1 min-w-0">
 
@@ -791,20 +1089,26 @@ export default function Orders() {
                                                 e.stopPropagation()
                                                 const next = getNextStatus(o)
                                                 if (!next) return
-                                                handleStatusAdvance(o, next)
+                                                // waiting_restock → ready must go through stock verification
+                                                if (o.status === 'waiting_restock' && next === 'ready') {
+                                                    setSelected(o)         // open the detail panel
+                                                    setError('')
+                                                    fetchOrderFinancials(o)
+                                                } else {
+                                                    handleStatusAdvance(o, next)
+                                                }
                                             }}
                                             disabled={saving}
                                             className={`w-full py-2 rounded-xl text-xs font-semibold flex items-center justify-center gap-1.5 transition-all border
-                        ${o.status === 'waiting_restock'
+                ${o.status === 'waiting_restock'
                                                     ? 'bg-pink-50 hover:bg-pink-100 text-pink-700 border-pink-200'
                                                     : 'bg-slate-50 hover:bg-sky-50 hover:text-sky-600 border-slate-200 hover:border-sky-200 text-slate-500'}`}>
                                             <ArrowRight size={13} />
-                                            {o.status === 'waiting_restock'
-                                                ? 'Stock arrived → Mark Ready'
-                                                : `Move to ${nextSi?.label}`}
+                                            {o.status === 'waiting_restock' ? 'View to restock →' : `Move to ${si(next).label}`}
                                         </button>
                                     </div>
                                 )}
+
 
                                 {/* Paid indicator */}
                                 {o.status === 'paid' && (
@@ -1193,26 +1497,24 @@ export default function Orders() {
                                         <div className="bg-pink-50 border border-pink-200 rounded-xl p-3">
                                             <p className="text-sm font-bold text-pink-700">⏸️ Waiting for restock</p>
                                             <p className="text-xs text-pink-500 mt-1">
-                                                Add stock in the <strong>Stock</strong> page, then come back and tap below.
+                                                Go to <strong>Stock</strong> page → add the missing quantity → come back here.
                                             </p>
                                         </div>
-                                        <button
-                                            onClick={async () => {
-                                                // Always fetch the freshest version of the order before acting
-                                                const { data: freshOrder } = await supabase
-                                                    .from('orders')
-                                                    .select('*, clients(id, name, phone), order_items(*, products(name))')
-                                                    .eq('id', selected.id)
-                                                    .single()
 
-                                                if (freshOrder) {
-                                                    setSelected(freshOrder)
-                                                    await applyStatusChange(freshOrder, 'ready')
-                                                }
-                                            }}
+                                        {error && (
+                                            <div className="bg-red-50 border border-red-200 rounded-xl p-3 text-xs text-red-600 whitespace-pre-line font-medium">
+                                                ⚠️ {error}
+                                                <button onClick={() => setError('')} className="block mt-1 text-red-400 underline">
+                                                    Dismiss
+                                                </button>
+                                            </div>
+                                        )}
+
+                                        <button
+                                            onClick={fulfillRestockedOrder}
                                             disabled={saving}
-                                            className="w-full py-3 bg-pink-500 hover:bg-pink-600 text-white rounded-xl font-semibold text-sm disabled:opacity-50 transition-colors flex items-center justify-center gap-2">
-                                            {saving ? 'Checking stock...' : '✅ Stock available — Mark as Ready'}
+                                            className="w-full py-3 bg-pink-500 hover:bg-pink-600 text-white rounded-xl font-bold text-sm disabled:opacity-50 transition-colors flex items-center justify-center gap-2">
+                                            {saving ? 'Checking stock...' : '✅ Stock ready — Mark as Ready'}
                                         </button>
                                     </div>
                                 )
@@ -1462,6 +1764,116 @@ export default function Orders() {
                                 </div>
                             )}
 
+                            {/* ── ORDER FINANCIALS ── */}
+                            <div className="border-t border-slate-100 pt-4 mb-4">
+                                <p className="text-xs font-bold text-slate-400 uppercase tracking-wider mb-3">
+                                    💰 Order Financials
+                                </p>
+
+                                {loadingFin ? (
+                                    <div className="text-xs text-slate-400 text-center py-4 animate-pulse">
+                                        Calculating...
+                                    </div>
+
+                                ) : !financials || financials.error ? (
+                                    <div className="text-xs text-slate-400 text-center py-4">
+                                        Could not load financial data.
+                                    </div>
+
+                                ) : (
+                                    <div className="space-y-2">
+
+                                        {/* Cost breakdown table */}
+                                        <div className="bg-slate-50 rounded-xl overflow-hidden">
+
+                                            {/* Revenue row */}
+                                            <div className="flex items-center justify-between px-4 py-3 border-b border-slate-200">
+                                                <span className="text-sm font-bold text-slate-700">Revenue</span>
+                                                <span className="text-sm font-bold text-slate-800">
+                                                    {financials.hasRevenue
+                                                        ? `${financials.revenue.toFixed(2)} TND`
+                                                        : <span className="text-amber-500 font-normal text-xs">Not set — edit order to add price</span>}
+                                                </span>
+                                            </div>
+
+                                            {/* Cost lines */}
+                                            {financials.costBreakdown.map((line, idx) => (
+                                                <div key={idx} className="px-4 py-2.5 border-b border-slate-100 last:border-0">
+                                                    <div className="flex items-center justify-between">
+                                                        <span className="text-xs font-medium text-slate-600">{line.label}</span>
+                                                        <span className={`text-xs font-semibold ${line.amount > 0 ? 'text-red-500' : 'text-slate-400'}`}>
+                                                            {line.amount > 0 ? `− ${line.amount.toFixed(2)} TND` : '—'}
+                                                        </span>
+                                                    </div>
+                                                    {line.sub && (
+                                                        <p className="text-xs text-slate-400 mt-0.5">{line.sub}</p>
+                                                    )}
+                                                </div>
+                                            ))}
+
+                                            {/* No cost data hint */}
+                                            {!financials.hasCost && (
+                                                <div className="px-4 py-3 text-xs text-slate-400">
+                                                    {financials.type === 'custom'
+                                                        ? '💡 Log the production with filament & time to see costs.'
+                                                        : '💡 Set production cost in the Products catalogue to see costs.'}
+                                                </div>
+                                            )}
+                                        </div>
+
+                                        {/* Profit result */}
+                                        {financials.hasRevenue && financials.hasCost && (
+                                            <div className={`rounded-xl p-4 ${financials.profit >= 0
+                                                ? 'bg-emerald-50 border border-emerald-200'
+                                                : 'bg-red-50 border border-red-200'
+                                                }`}>
+                                                <div className="flex items-center justify-between mb-1">
+                                                    <span className={`text-xs font-semibold uppercase tracking-wider ${financials.profit >= 0 ? 'text-emerald-600' : 'text-red-600'}`}>
+                                                        {financials.profit >= 0 ? '✅ Profit' : '⚠️ Loss'}
+                                                    </span>
+                                                    <span className={`text-xl font-bold ${financials.profit >= 0 ? 'text-emerald-700' : 'text-red-600'}`}>
+                                                        {financials.profit >= 0 ? '+' : ''}{financials.profit.toFixed(2)} TND
+                                                    </span>
+                                                </div>
+
+                                                {financials.margin !== null && (
+                                                    <div className="mt-2">
+                                                        <div className="flex justify-between text-xs mb-1">
+                                                            <span className="text-slate-500">Margin</span>
+                                                            <span className={`font-bold ${financials.margin >= 40 ? 'text-emerald-600' :
+                                                                financials.margin >= 20 ? 'text-amber-600' : 'text-red-500'
+                                                                }`}>
+                                                                {financials.margin.toFixed(1)}%
+                                                            </span>
+                                                        </div>
+                                                        <div className="h-1.5 bg-white/70 rounded-full overflow-hidden">
+                                                            <div
+                                                                className={`h-full rounded-full ${financials.margin >= 40 ? 'bg-emerald-500' :
+                                                                    financials.margin >= 20 ? 'bg-amber-400' : 'bg-red-400'
+                                                                    }`}
+                                                                style={{ width: `${Math.min(Math.max(financials.margin, 0), 100)}%` }} />
+                                                        </div>
+                                                        <div className="flex justify-between text-xs text-slate-300 mt-0.5">
+                                                            <span>0%</span>
+                                                            <span>20%</span>
+                                                            <span>40%</span>
+                                                            <span>100%</span>
+                                                        </div>
+                                                    </div>
+                                                )}
+                                            </div>
+                                        )}
+
+                                        {/* Missing price warning */}
+                                        {!financials.hasRevenue && (
+                                            <div className="bg-amber-50 border border-amber-200 rounded-xl p-3 text-xs text-amber-700">
+                                                ⚠️ No price set on this order. Edit the order to add the agreed price and see profitability.
+                                            </div>
+                                        )}
+                                    </div>
+                                )}
+                            </div>
+
                             {/* Contact buttons */}
                             {selected.clients?.phone && (
                                 <div className="grid grid-cols-2 gap-2">
@@ -1658,34 +2070,54 @@ export default function Orders() {
                             )}
                         </div>
 
-                        {/* Action buttons — fixed at bottom */}
+                        {/* Action buttons */}
                         <div className="p-5 border-t bg-white flex-shrink-0 space-y-2 rounded-b-3xl sm:rounded-b-2xl">
+
+                            {/* Selected summary */}
+                            {Object.values(packagingSelection).some(q => q > 0) ? (
+                                <div className="bg-slate-50 rounded-xl px-3 py-2 mb-3">
+                                    <div className="flex justify-between text-xs text-slate-500 mb-1">
+                                        <span className="font-medium">Packaging selected:</span>
+                                        <span className="font-bold text-slate-700">
+                                            {Object.entries(packagingSelection)
+                                                .filter(([, q]) => q > 0)
+                                                .map(([mid, q]) => {
+                                                    const mat = packagingMaterials.find(m => m.id === mid)
+                                                    return `${mat?.name} ×${q}`
+                                                }).join(' · ')}
+                                        </span>
+                                    </div>
+                                    {(() => {
+                                        const total = Object.entries(packagingSelection)
+                                            .filter(([, q]) => q > 0)
+                                            .reduce((s, [mid, q]) => {
+                                                const mat = packagingMaterials.find(m => m.id === mid)
+                                                return s + (q * (mat?.cost_per_unit || 0))
+                                            }, 0)
+                                        return total > 0
+                                            ? <p className="text-xs text-indigo-600 font-semibold text-right">
+                                                Packaging cost: {total.toFixed(2)} TND
+                                            </p>
+                                            : null
+                                    })()}
+                                </div>
+                            ) : (
+                                <p className="text-xs text-slate-400 text-center mb-3">
+                                    No packaging selected — leave empty for hand-to-hand delivery
+                                </p>
+                            )}
+
                             <button
                                 onClick={() => confirmDelivery(false)}
                                 disabled={confirmingPkg}
                                 className="w-full py-3.5 bg-indigo-500 hover:bg-indigo-600 disabled:opacity-50 text-white rounded-xl font-bold text-sm transition-colors flex items-center justify-center gap-2 shadow-sm">
-                                {confirmingPkg
-                                    ? 'Delivering...'
-                                    : Object.values(packagingSelection).some(q => q > 0)
-                                        ? `🚚 Confirm Delivery with Packaging`
-                                        : `🚚 Confirm Delivery`}
+                                {confirmingPkg ? 'Confirming...' : '🚚 Confirm Delivery'}
                             </button>
 
                             <button
-                                onClick={() => confirmDelivery(true)}
+                                onClick={() => { setShowPackagingModal(false); setPendingDelivery(null); setPackagingSelection({}) }}
                                 disabled={confirmingPkg}
-                                className="w-full py-2.5 border border-slate-200 hover:bg-slate-50 text-slate-500 rounded-xl text-sm font-medium transition-colors">
-                                🤝 Hand-to-hand — No packaging
-                            </button>
-
-                            <button
-                                onClick={() => {
-                                    setShowPackagingModal(false)
-                                    setPendingDelivery(null)
-                                    setPackagingSelection({})
-                                }}
-                                disabled={confirmingPkg}
-                                className="w-full py-2 text-xs text-slate-400 hover:text-slate-600 transition-colors">
+                                className="w-full py-2.5 border border-slate-200 text-slate-500 hover:bg-slate-50 rounded-xl text-sm font-medium transition-colors">
                                 Cancel
                             </button>
                         </div>

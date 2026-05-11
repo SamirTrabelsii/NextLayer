@@ -186,13 +186,25 @@ export default function Productions() {
             }
 
             // 2. Calculate actual cost and sync to product
-            const actualCost = calcProductionCost(prod.filament_grams, prod.print_time_hours)
+            const calculatedCost = calcProductionCost(prod.filament_grams, prod.print_time_hours)
 
-            if (prod.product_id && actualCost > 0) {
-                // Sync actual cost back to the product's production_cost
-                // This keeps product cost aligned with real production data
+            if (prod.product_id) {
+                const actualCost = parseFloat(prod.actual_cost) || calculatedCost
+
+                // Fetch BOM to include material costs in the product cost
+                const { data: bom } = await supabase
+                    .from('product_materials')
+                    .select('quantity_per_unit, materials(cost_per_unit)')
+                    .eq('product_id', prod.product_id)
+
+                const bomCost = (bom || []).reduce((s, b) =>
+                    s + ((b.quantity_per_unit || 1) * (b.materials?.cost_per_unit || 0)), 0)
+
+                const fullCost = parseFloat((actualCost + bomCost).toFixed(3))
+
+                // Sync to product — now includes filament + electricity + materials
                 await supabase.from('products')
-                    .update({ production_cost: actualCost })
+                    .update({ production_cost: fullCost })
                     .eq('id', prod.product_id)
             }
 
