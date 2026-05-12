@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react'
 import { supabase } from '../lib/supabase'
-import { Plus, X, Trash2, Receipt, TrendingDown, Search } from 'lucide-react'
+import { Plus, X, Trash2, Receipt, TrendingDown, Search, Pencil } from 'lucide-react'
 
 const CATEGORIES = [
     { key: 'filament', label: 'Filament', emoji: '🧵', color: 'bg-blue-100 text-blue-700' },
@@ -21,6 +21,7 @@ export default function Expenses() {
     const [deleting, setDeleting] = useState(null)
     const [filterCat, setFilterCat] = useState('all')
     const [filterMonth, setFilterMonth] = useState(new Date().toISOString().slice(0, 7))
+    const [editing, setEditing] = useState(null)
 
     useEffect(() => { fetchExpenses() }, [])
 
@@ -37,13 +38,24 @@ export default function Expenses() {
     async function saveExpense() {
         if (!form.amount || !form.description.trim()) return
         setSaving(true)
-        await supabase.from('expenses').insert([{
-            ...form,
+
+        const payload = {
+            category: form.category,
             amount: parseFloat(form.amount),
-        }])
+            description: form.description.trim(),
+            date: form.date,
+        }
+
+        if (editing) {
+            await supabase.from('expenses').update(payload).eq('id', editing)
+        } else {
+            await supabase.from('expenses').insert([payload])
+        }
+
         setSaving(false)
         setShowModal(false)
         setForm(empty)
+        setEditing(null)
         fetchExpenses()
     }
 
@@ -51,6 +63,23 @@ export default function Expenses() {
         await supabase.from('expenses').delete().eq('id', id)
         setDeleting(null)
         fetchExpenses()
+    }
+
+    function openEdit(expense) {
+        setForm({
+            category: expense.category,
+            amount: String(expense.amount),
+            description: expense.description,
+            date: expense.date,
+        })
+        setEditing(expense.id)
+        setShowModal(true)
+    }
+
+    function closeModal() {
+        setShowModal(false)
+        setForm(empty)
+        setEditing(null)
     }
 
     // Filter
@@ -183,6 +212,10 @@ export default function Expenses() {
                                             </div>
                                             <div className="flex items-center gap-2 flex-shrink-0">
                                                 <p className="font-bold text-red-500">{e.amount.toFixed(2)} TND</p>
+                                                <button onClick={() => openEdit(e)}
+                                                    className="p-1.5 text-slate-300 hover:text-sky-500 hover:bg-sky-50 rounded-lg transition-colors">
+                                                    <Pencil size={14} />
+                                                </button>
                                                 <button onClick={() => setDeleting(e)}
                                                     className="p-1.5 text-slate-300 hover:text-red-500 hover:bg-red-50 rounded-lg transition-colors">
                                                     <Trash2 size={14} />
@@ -202,7 +235,9 @@ export default function Expenses() {
                 <div className="fixed inset-0 bg-black/40 z-50 flex items-end sm:items-center justify-center p-0 sm:p-4">
                     <div className="bg-white w-full sm:max-w-md rounded-t-3xl sm:rounded-2xl shadow-2xl">
                         <div className="flex items-center justify-between p-5 border-b sticky top-0 bg-white rounded-t-3xl">
-                            <h2 className="text-lg font-bold text-slate-800">Log Expense</h2>
+                            <h2 className="text-lg font-bold text-slate-800">
+                                {editing ? 'Edit Expense' : 'Log Expense'}
+                            </h2>
                             <button onClick={() => setShowModal(false)} className="p-2 hover:bg-slate-100 rounded-xl">
                                 <X size={20} />
                             </button>
@@ -262,7 +297,7 @@ export default function Expenses() {
                             <button onClick={saveExpense}
                                 disabled={saving || !form.amount || !form.description.trim()}
                                 className="flex-1 py-3 bg-sky-500 hover:bg-sky-600 disabled:opacity-50 text-white rounded-xl text-sm font-medium">
-                                {saving ? 'Saving...' : 'Log Expense'}
+                                {saving ? 'Saving...' : editing ? 'Save Changes' : 'Log Expense'}
                             </button>
                         </div>
                     </div>

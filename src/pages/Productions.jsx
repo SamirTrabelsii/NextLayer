@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react'
 import { supabase } from '../lib/supabase'
 import { Plus, X, Trash2, Printer, Clock, Zap, PackagePlus, ArrowRight } from 'lucide-react'
+import { useSettings } from '../lib/SettingsContext'
 
 // ─── CONSTANTS ────────────────────────────────────────────────
 const STATUSES = [
@@ -14,12 +15,13 @@ const FLOW = ['queued', 'printing', 'done']
 const MATERIALS = ['PLA', 'PETG', 'ABS', 'TPU', 'Resin', 'Other']
 const CATEGORIES = ['Keychains', 'Clickers', 'Decorations', 'Custom Orders']
 
-const FILAMENT_PRICE_PER_KG = 35
-const ELECTRICITY_PER_HOUR = 0.15
+// Remove these two lines:
+// const FILAMENT_PRICE_PER_KG = 35
+// const ELECTRICITY_PER_HOUR = 0.15
 
 function calcCost(grams, hours) {
-    const f = ((parseFloat(grams) || 0) / 1000) * FILAMENT_PRICE_PER_KG
-    const e = (parseFloat(hours) || 0) * ELECTRICITY_PER_HOUR
+    const f = ((parseFloat(grams) || 0) / 1000) * settings.filament_price_per_kg
+    const e = (parseFloat(hours) || 0) * settings.electricity_per_hour
     return parseFloat((f + e).toFixed(2))
 }
 
@@ -58,6 +60,8 @@ export default function Productions() {
     const [showNewProduct, setShowNewProduct] = useState(false)
     const [newProduct, setNewProduct] = useState(emptyProduct)
     const [savingProduct, setSavingProduct] = useState(false)
+
+    const { settings } = useSettings()
 
     useEffect(() => { fetchAll() }, [])
 

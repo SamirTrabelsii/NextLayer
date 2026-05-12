@@ -6,11 +6,15 @@ export const ELECTRICITY_PER_HOUR = 0.15 // TND — update to your real rate
  * Calculate production cost from raw inputs + BOM materials
  * Used consistently in Products, Productions, and anywhere else
  */
-export function calcProductionCost(filamentGrams, printTimeHours, bomItems = []) {
-    const filament = ((parseFloat(filamentGrams) || 0) / 1000) * FILAMENT_PRICE_PER_KG
-    const electricity = (parseFloat(printTimeHours) || 0) * ELECTRICITY_PER_HOUR
+export function calcProductionCost(filamentGrams, printTimeHours, bomItems = [], rates = {}) {
+    const filamentRate = rates.filament_price_per_kg ?? 35
+    const electricRate = rates.electricity_per_hour ?? 0.15
+
+    const filament = ((parseFloat(filamentGrams) || 0) / 1000) * filamentRate
+    const electricity = (parseFloat(printTimeHours) || 0) * electricRate
     const materials = bomItems.reduce((sum, b) =>
         sum + ((b.quantity_per_unit || 1) * (b.materials?.cost_per_unit || 0)), 0)
+
     return parseFloat((filament + electricity + materials).toFixed(3))
 }
 

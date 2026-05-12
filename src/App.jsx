@@ -10,6 +10,7 @@ import Clients from './pages/Clients'
 import Reseller from './pages/Reseller'
 import Expenses from './pages/Expenses'
 import Ideas from './pages/Ideas'
+import Settings from './pages/Settings'
 
 export default function App() {
   return (
@@ -27,6 +28,7 @@ export default function App() {
           <Route path="reseller" element={<Reseller />} />
           <Route path="expenses" element={<Expenses />} />
           <Route path="ideas" element={<Ideas />} />
+          <Route path="settings" element={<Settings />} />
         </Route>
       </Routes>
     </BrowserRouter>

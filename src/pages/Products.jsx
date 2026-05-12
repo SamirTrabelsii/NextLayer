@@ -1,11 +1,14 @@
 import { useState, useEffect } from 'react'
 import { supabase } from '../lib/supabase'
 import { Plus, Pencil, Trash2, Search, X, Package } from 'lucide-react'
+import { useSettings } from '../lib/SettingsContext'
 
 const CATEGORIES = ['All', 'Keychains', 'Clickers', 'Decorations', 'Custom Orders']
 const MATERIALS = ['PLA', 'PETG', 'ABS', 'TPU', 'Resin', 'Other']
-const FILAMENT_PRICE_PER_KG = 35
-const ELECTRICITY_PER_HOUR = 0.15
+
+// Replace the two hardcoded constants:
+// const FILAMENT_PRICE_PER_KG = 35  ← remove
+// const ELECTRICITY_PER_HOUR  = 0.15 ← remove
 
 const empty = {
     name: '', category: 'Keychains', material: 'PLA', color: '',
@@ -79,7 +82,12 @@ export default function Products() {
         const { name, value, type, checked } = e.target
         const updated = { ...form, [name]: type === 'checkbox' ? checked : value }
         if (['filament_grams', 'print_time_hours'].includes(name)) {
-            updated.production_cost = calcProductCost(updated, productMaterials)
+            updated.production_cost = calcProductionCost(
+                updated.filament_grams,
+                updated.print_time_hours,
+                productMaterials,
+                settings   // pass settings so the function uses live rates
+            )
         }
         setForm(updated)
     }

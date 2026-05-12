@@ -1,7 +1,7 @@
 import { Outlet, NavLink } from 'react-router-dom'
 import {
     LayoutDashboard, ShoppingCart, Box, Users,
-    Receipt, Lightbulb, Printer, Package, Handshake, Wrench
+    Receipt, Lightbulb, Printer, Package, Handshake, Wrench, Settings as SettingsIcon
 } from 'lucide-react'
 
 // ← Drop your logo here once you share the path
@@ -18,6 +18,7 @@ const nav = [
     { to: '/reseller', icon: Handshake, label: 'Reseller' },
     { to: '/expenses', icon: Receipt, label: 'Expenses' },
     { to: '/ideas', icon: Lightbulb, label: 'Ideas' },
+    { to: '/settings', icon: SettingsIcon, label: 'Settings' },
 ]
 
 export default function Layout() {
