@@ -107,7 +107,13 @@ export default function Dashboard() {
         cancelled: 'bg-red-100 text-red-600', waiting_restock: 'bg-pink-100 text-pink-700',
     }
 
-    const EXP_EMOJI = { filament: '🧵', electricity: '⚡', tools: '🔧', shipping: '📦', other: '💼' }
+    const EXP_EMOJI = {
+        filament: '🧵',
+        electricity: '⚡',
+        material: '🔩',   // was 'tools': '🔧'
+        shipping: '📦',
+        other: '💼',
+    }
 
     return (
         <div className="max-w-5xl mx-auto space-y-5">

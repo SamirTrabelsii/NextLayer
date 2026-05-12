@@ -20,7 +20,14 @@ const MANUAL_TYPES = [
 ]
 
 const emptyMat = { name: '', category: 'crafting', unit: 'unit', cost_per_unit: '', low_stock_threshold: 5, notes: '' }
-const emptyMove = { material_id: '', type: 'purchased', quantity: 1, notes: '' }
+const emptyMove = {
+    material_id: '',
+    type: 'purchased',
+    quantity: 1,
+    notes: '',
+    amount: '',
+    purchase_date: new Date().toISOString().split('T')[0],
+}
 
 export default function Materials() {
     const [materials, setMaterials] = useState([])
@@ -85,28 +92,51 @@ export default function Materials() {
         const mt = MANUAL_TYPES.find(t => t.key === moveForm.type)
         const isPlus = mt.sign > 0
         const qty = parseInt(moveForm.quantity)
-
         const mat = materials.find(m => m.id === moveForm.material_id)
+
+        // Block negative movements if not enough stock
         if (!isPlus && (mat?.quantity_available || 0) < qty) {
             setError(`Not enough stock. Available: ${mat?.quantity_available || 0}`)
             setSaving(false)
             return
         }
 
-        await supabase.from('material_movements').insert([{
-            material_id: moveForm.material_id,
-            type: moveForm.type,
-            quantity: qty,
-            is_positive: isPlus,
-            notes: moveForm.notes,
-        }])
+        try {
+            // 1. Log movement
+            await supabase.from('material_movements').insert([{
+                material_id: moveForm.material_id,
+                type: moveForm.type,
+                quantity: qty,
+                is_positive: isPlus,
+                notes: moveForm.notes || null,
+            }])
 
-        const newQty = (mat?.quantity_available || 0) + (isPlus ? qty : -qty)
-        await supabase.from('materials').update({
-            quantity_available: Math.max(0, newQty)
-        }).eq('id', moveForm.material_id)
+            // 2. Update stock
+            const newQty = (mat?.quantity_available || 0) + (isPlus ? qty : -qty)
+            await supabase.from('materials').update({
+                quantity_available: Math.max(0, newQty),
+            }).eq('id', moveForm.material_id)
 
-        setSaving(false); closeMove(); fetchAll()
+            // 3. Auto-create expense if this is a purchase
+            if (moveForm.type === 'purchased' && parseFloat(moveForm.amount) > 0) {
+                await supabase.from('expenses').insert([{
+                    category: 'material',
+                    amount: parseFloat(moveForm.amount),
+                    description: mat?.name || 'Material purchase',
+                    date: moveForm.purchase_date || new Date().toISOString().split('T')[0],
+                }])
+            }
+
+            setShowMove(false)
+            setMoveForm(emptyMove)
+            fetchAll()
+
+        } catch (err) {
+            console.error(err)
+            setError('Something went wrong.')
+        } finally {
+            setSaving(false)
+        }
     }
 
     const catInfo = key => CATEGORIES.find(c => c.key === key) || CATEGORIES[5]
@@ -407,53 +437,130 @@ export default function Materials() {
             {/* Log Movement Modal */}
             {showMoveModal && (
                 <div className="fixed inset-0 bg-black/40 z-50 flex items-end sm:items-center justify-center p-0 sm:p-4">
-                    <div className="bg-white w-full sm:max-w-md rounded-t-3xl sm:rounded-2xl shadow-2xl max-h-[85vh] sm:max-h-[92vh] overflow-y-auto mb-16 sm:mb-0">
+                    <div className="bg-white w-full sm:max-w-md rounded-t-3xl sm:rounded-2xl shadow-2xl
+                      max-h-[85vh] sm:max-h-[92vh] overflow-y-auto mb-16 sm:mb-0">
+
                         <div className="flex items-center justify-between p-5 border-b sticky top-0 bg-white rounded-t-3xl z-10">
                             <h2 className="text-lg font-bold text-slate-800">Stock Movement</h2>
-                            <button onClick={closeMove} className="p-2 hover:bg-slate-100 rounded-xl"><X size={20} /></button>
+                            <button onClick={() => { setShowMove(false); setMoveForm(emptyMove) }}
+                                className="p-2 hover:bg-slate-100 rounded-xl"><X size={20} /></button>
                         </div>
+
                         <div className="p-5 space-y-4">
+
+                            {/* Material */}
                             <div>
-                                <label className="text-sm font-medium text-slate-700 block mb-1">Material *</label>
+                                <label className="text-sm font-medium text-slate-700 block mb-1.5">Material *</label>
                                 <select value={moveForm.material_id}
-                                    onChange={e => setMoveForm(f => ({ ...f, material_id: e.target.value }))}
+                                    onChange={e => {
+                                        const matId = e.target.value
+                                        const mat = materials.find(m => m.id === matId)
+                                        const autoAmount = mat?.cost_per_unit
+                                            ? (mat.cost_per_unit * (parseInt(moveForm.quantity) || 1)).toFixed(2)
+                                            : moveForm.amount
+                                        setMoveForm(f => ({ ...f, material_id: matId, amount: autoAmount }))
+                                    }}
                                     className="w-full border border-slate-200 rounded-xl px-3 py-2.5 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-sky-300">
                                     <option value="">Select material...</option>
                                     {materials.map(m => (
                                         <option key={m.id} value={m.id}>
-                                            {catInfo(m.category).emoji} {m.name} ({m.quantity_available} available)
+                                            {catInfo(m.category).emoji} {m.name} ({m.quantity_available} in stock)
                                         </option>
                                     ))}
                                 </select>
                             </div>
 
+                            {/* Movement type */}
                             <div>
                                 <label className="text-sm font-medium text-slate-700 block mb-2">Type *</label>
                                 <div className="space-y-2">
                                     {MANUAL_TYPES.map(t => (
                                         <button key={t.key}
                                             onClick={() => setMoveForm(f => ({ ...f, type: t.key }))}
-                                            className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl border text-left transition-all
-                        ${moveForm.type === t.key ? 'border-sky-400 bg-sky-50 ring-2 ring-sky-200' : 'border-slate-200 hover:bg-slate-50'}`}>
-                                            <span className="text-lg">{t.emoji}</span>
+                                            className={`w-full flex items-center gap-3 px-3 py-3 rounded-xl border text-left transition-all
+                                              ${moveForm.type === t.key
+                                                    ? 'border-sky-400 bg-sky-50 ring-2 ring-sky-200'
+                                                    : 'border-slate-200 bg-white hover:bg-slate-50'}`}>
+                                            <span className="text-xl">{t.emoji}</span>
                                             <div>
                                                 <p className="text-sm font-semibold text-slate-800">{t.label}</p>
-                                                <p className="text-xs text-slate-400">{t.desc} · {t.sign > 0 ? 'Adds to' : 'Removes from'} stock</p>
+                                                <p className="text-xs text-slate-400">
+                                                    {t.desc} · {t.sign > 0 ? 'Adds to' : 'Removes from'} stock
+                                                </p>
                                             </div>
                                         </button>
                                     ))}
                                 </div>
                             </div>
 
+                            {/* Quantity */}
                             <div>
-                                <label className="text-sm font-medium text-slate-700 block mb-1">Quantity *</label>
-                                <input type="number" min="1" value={moveForm.quantity}
-                                    onChange={e => setMoveForm(f => ({ ...f, quantity: e.target.value }))}
-                                    className="w-full border border-slate-200 rounded-xl px-3 py-2.5 text-lg font-semibold text-center focus:outline-none focus:ring-2 focus:ring-sky-300 border-slate-200" />
+                                <label className="text-sm font-medium text-slate-700 block mb-1.5">Quantity *</label>
+                                <input
+                                    type="number" min="1" value={moveForm.quantity}
+                                    onChange={e => {
+                                        const qty = e.target.value
+                                        const mat = materials.find(m => m.id === moveForm.material_id)
+                                        const autoAmount = mat?.cost_per_unit && moveForm.type === 'purchased'
+                                            ? (mat.cost_per_unit * (parseInt(qty) || 1)).toFixed(2)
+                                            : moveForm.amount
+                                        setMoveForm(f => ({ ...f, quantity: qty, amount: autoAmount }))
+                                    }}
+                                    className="w-full border border-slate-200 rounded-xl px-3 py-2.5 text-lg font-semibold text-center focus:outline-none focus:ring-2 focus:ring-sky-300" />
                             </div>
 
+                            {/* Purchase-only fields */}
+                            {moveForm.type === 'purchased' && (
+                                <div className="bg-emerald-50 border border-emerald-200 rounded-xl p-4 space-y-3">
+                                    <p className="text-xs font-bold text-emerald-700 uppercase tracking-wider">
+                                        💰 Purchase Details — will create an expense automatically
+                                    </p>
+
+                                    <div>
+                                        <label className="text-sm font-medium text-slate-700 block mb-1.5">
+                                            Amount paid (TND) *
+                                        </label>
+                                        <input
+                                            type="number"
+                                            value={moveForm.amount}
+                                            onChange={e => setMoveForm(f => ({ ...f, amount: e.target.value }))}
+                                            placeholder="0.00"
+                                            className="w-full border border-emerald-300 rounded-xl px-3 py-2.5 text-sm font-semibold bg-white focus:outline-none focus:ring-2 focus:ring-emerald-400" />
+                                        {materials.find(m => m.id === moveForm.material_id)?.cost_per_unit > 0 && (
+                                            <p className="text-xs text-emerald-600 mt-1">
+                                                Auto-calculated from {materials.find(m => m.id === moveForm.material_id)?.cost_per_unit} TND/unit × {moveForm.quantity} unit{moveForm.quantity > 1 ? 's' : ''}
+                                            </p>
+                                        )}
+                                    </div>
+
+                                    <div>
+                                        <label className="text-sm font-medium text-slate-700 block mb-1.5">
+                                            Purchase Date
+                                        </label>
+                                        <input
+                                            type="date"
+                                            value={moveForm.purchase_date}
+                                            onChange={e => setMoveForm(f => ({ ...f, purchase_date: e.target.value }))}
+                                            className="w-full border border-emerald-300 rounded-xl px-3 py-2.5 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-emerald-400" />
+                                    </div>
+
+                                    {/* Preview of the expense that will be created */}
+                                    {moveForm.amount && (
+                                        <div className="bg-white rounded-xl px-3 py-2.5 text-xs text-slate-600 border border-emerald-200">
+                                            <p className="font-semibold text-slate-700 mb-0.5">Expense that will be created:</p>
+                                            <p>📦 Category: <span className="font-medium">Materials &amp; Supplies</span></p>
+                                            <p>📝 Description: <span className="font-medium">
+                                                {materials.find(m => m.id === moveForm.material_id)?.name || '—'}
+                                            </span></p>
+                                            <p>💰 Amount: <span className="font-medium text-red-500">{moveForm.amount} TND</span></p>
+                                        </div>
+                                    )}
+                                </div>
+                            )}
+
+                            {/* Notes */}
                             <div>
-                                <label className="text-sm font-medium text-slate-700 block mb-1">Notes</label>
+                                <label className="text-sm font-medium text-slate-700 block mb-1.5">Notes</label>
                                 <input value={moveForm.notes}
                                     onChange={e => setMoveForm(f => ({ ...f, notes: e.target.value }))}
                                     placeholder="Optional details..."
@@ -466,13 +573,18 @@ export default function Materials() {
                                 </div>
                             )}
                         </div>
+
                         <div className="p-5 pt-0 flex gap-3">
-                            <button onClick={closeMove}
-                                className="flex-1 py-3 border border-slate-200 rounded-xl text-sm font-medium hover:bg-slate-50">Cancel</button>
-                            <button onClick={logMovement}
-                                disabled={saving || !moveForm.material_id || !moveForm.quantity}
-                                className="flex-1 py-3 bg-sky-500 hover:bg-sky-600 disabled:opacity-50 text-white rounded-xl text-sm font-medium">
-                                {saving ? 'Saving...' : 'Apply'}
+                            <button onClick={() => { setShowMove(false); setMoveForm(emptyMove) }}
+                                className="flex-1 py-3 border border-slate-200 rounded-xl text-sm font-medium hover:bg-slate-50">
+                                Cancel
+                            </button>
+                            <button
+                                onClick={logMovement}
+                                disabled={saving || !moveForm.material_id || !moveForm.quantity ||
+                                    (moveForm.type === 'purchased' && !moveForm.amount)}
+                                className="flex-1 py-3 bg-sky-500 hover:bg-sky-600 disabled:opacity-50 text-white rounded-xl text-sm font-semibold">
+                                {saving ? 'Saving...' : moveForm.type === 'purchased' ? 'Add Stock + Log Expense' : 'Apply'}
                             </button>
                         </div>
                     </div>

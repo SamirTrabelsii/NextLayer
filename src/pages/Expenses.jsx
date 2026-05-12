@@ -5,7 +5,7 @@ import { Plus, X, Trash2, Receipt, TrendingDown, Search } from 'lucide-react'
 const CATEGORIES = [
     { key: 'filament', label: 'Filament', emoji: '🧵', color: 'bg-blue-100 text-blue-700' },
     { key: 'electricity', label: 'Electricity', emoji: '⚡', color: 'bg-yellow-100 text-yellow-700' },
-    { key: 'tools', label: 'Tools', emoji: '🔧', color: 'bg-purple-100 text-purple-700' },
+    { key: 'material', label: 'Materials & Supplies', emoji: '🔩', color: 'bg-purple-100 text-purple-700' },
     { key: 'shipping', label: 'Shipping', emoji: '📦', color: 'bg-orange-100 text-orange-700' },
     { key: 'other', label: 'Other', emoji: '💼', color: 'bg-slate-100 text-slate-600' },
 ]
