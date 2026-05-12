@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react'
 import { supabase } from '../lib/supabase'
 import { Plus, X, Trash2, CheckCircle, TrendingUp } from 'lucide-react'
+import { useNavigate } from 'react-router-dom'
 
 const emptyConsignment = {
     reseller_id: '', product_id: '', quantity_given: '',
@@ -18,6 +19,7 @@ export default function Reseller() {
     const [sellQty, setSellQty] = useState(1)
     const [saving, setSaving] = useState(false)
     const [activeReseller, setActive] = useState(null)
+    const navigate = useNavigate()
 
     useEffect(() => { fetchAll() }, [])
 
@@ -185,10 +187,11 @@ export default function Reseller() {
                     To add a reseller, go to <strong>Clients</strong>, add or edit a client,
                     and enable the <strong>"Reseller"</strong> toggle.
                 </p>
-                <a href="/clients"
+                <button
+                    onClick={() => navigate('/clients')}
                     className="inline-flex items-center gap-2 bg-sky-500 hover:bg-sky-600 text-white px-5 py-2.5 rounded-xl font-medium text-sm transition-colors">
                     Go to Clients →
-                </a>
+                </button>
             </div>
         </div>
     )
