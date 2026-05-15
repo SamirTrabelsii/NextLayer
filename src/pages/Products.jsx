@@ -6,10 +6,6 @@ import { useSettings } from '../lib/SettingsContext'
 const CATEGORIES = ['All', 'Keychains', 'Clickers', 'Decorations', 'Custom Orders']
 const MATERIALS = ['PLA', 'PETG', 'ABS', 'TPU', 'Resin', 'Other']
 
-// Replace the two hardcoded constants:
-// const FILAMENT_PRICE_PER_KG = 35  ← remove
-// const ELECTRICITY_PER_HOUR  = 0.15 ← remove
-
 const empty = {
     name: '', category: 'Keychains', material: 'PLA', color: '',
     print_time_hours: '', filament_grams: '', production_cost: '',
@@ -29,6 +25,8 @@ export default function Products() {
     const [materials, setMaterials] = useState([])
     const [productMaterials, setProductMaterials] = useState([]) // BOM for current product
     const [bomItem, setBomItem] = useState({ material_id: '', quantity_per_unit: 1 })
+
+    const { settings } = useSettings()
 
     useEffect(() => { fetchProducts() }, [])
 
@@ -67,11 +65,12 @@ export default function Products() {
         setEditing(null)
     }
 
+    // Moved inside component so it can access settings from context
     function calcProductCost(formData, bom) {
         const grams = parseFloat(formData.filament_grams) || 0
         const hours = parseFloat(formData.print_time_hours) || 0
-        const filamentCost = (grams / 1000) * FILAMENT_PRICE_PER_KG
-        const electricityCost = hours * ELECTRICITY_PER_HOUR
+        const filamentCost = (grams / 1000) * (settings.filament_price_per_kg ?? 35)
+        const electricityCost = hours * (settings.electricity_per_hour ?? 0.15)
         const materialsCost = bom.reduce((s, b) =>
             s + ((b.quantity_per_unit || 1) * (b.materials?.cost_per_unit || 0)), 0)
         return (filamentCost + electricityCost + materialsCost).toFixed(2)
@@ -82,12 +81,7 @@ export default function Products() {
         const { name, value, type, checked } = e.target
         const updated = { ...form, [name]: type === 'checkbox' ? checked : value }
         if (['filament_grams', 'print_time_hours'].includes(name)) {
-            updated.production_cost = calcProductionCost(
-                updated.filament_grams,
-                updated.print_time_hours,
-                productMaterials,
-                settings   // pass settings so the function uses live rates
-            )
+            updated.production_cost = calcProductCost(updated, productMaterials)
         }
         setForm(updated)
     }

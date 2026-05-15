@@ -15,13 +15,10 @@ const FLOW = ['queued', 'printing', 'done']
 const MATERIALS = ['PLA', 'PETG', 'ABS', 'TPU', 'Resin', 'Other']
 const CATEGORIES = ['Keychains', 'Clickers', 'Decorations', 'Custom Orders']
 
-// Remove these two lines:
-// const FILAMENT_PRICE_PER_KG = 35
-// const ELECTRICITY_PER_HOUR = 0.15
-
-function calcCost(grams, hours) {
-    const f = ((parseFloat(grams) || 0) / 1000) * settings.filament_price_per_kg
-    const e = (parseFloat(hours) || 0) * settings.electricity_per_hour
+// Pure function — rates passed as arguments from settings context
+function calcCost(grams, hours, filamentRate = 35, electricRate = 0.15) {
+    const f = ((parseFloat(grams) || 0) / 1000) * filamentRate
+    const e = (parseFloat(hours) || 0) * electricRate
     return parseFloat((f + e).toFixed(2))
 }
 
@@ -141,7 +138,7 @@ export default function Productions() {
             if (name === 'filament_grams' || name === 'print_time_hours') {
                 const g = parseFloat(name === 'filament_grams' ? value : prev.filament_grams) || 0
                 const h = parseFloat(name === 'print_time_hours' ? value : prev.print_time_hours) || 0
-                updated.actual_cost = calcCost(g, h) || ''
+                updated.actual_cost = calcCost(g, h, settings.filament_price_per_kg, settings.electricity_per_hour) || ''
             }
             // Auto-fill description from order
             if (name === 'order_id' && value && !updated.description) {
@@ -801,7 +798,7 @@ export default function Productions() {
                                     placeholder="0.00"
                                     className="w-full border border-slate-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-sky-300 bg-sky-50 font-semibold" />
                                 <p className="text-xs text-slate-400 mt-1">
-                                    Based on {FILAMENT_PRICE_PER_KG} TND/kg filament + {ELECTRICITY_PER_HOUR} TND/hr electricity
+                                    Based on {settings.filament_price_per_kg} TND/kg filament + {settings.electricity_per_hour} TND/hr electricity
                                 </p>
                             </div>
 
