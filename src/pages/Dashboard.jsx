@@ -1,7 +1,73 @@
 import { useState, useEffect } from 'react'
 import { supabase } from '../lib/supabase'
 import { useNavigate } from 'react-router-dom'
-import { TrendingUp, TrendingDown, ShoppingCart, Users, Package, Printer, AlertCircle, ArrowRight } from 'lucide-react'
+import { TrendingUp, TrendingDown, ShoppingCart, Users, Package, Printer, AlertCircle, ArrowRight, DollarSign } from 'lucide-react'
+import {
+    BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer
+} from 'recharts'
+
+// Colors and Constants
+const C = {
+    emerald: '#10b981',
+    teal: '#14b8a6',
+    red: '#ef4444',
+    sky: '#0ea5e9',
+    indigo: '#6366f1',
+    amber: '#f59e0b',
+    slate: '#64748b',
+}
+
+const fmtShort = (v) => {
+    if (v === undefined || v === null) return '0'
+    if (v >= 1000) return (v / 1000).toFixed(1) + 'k'
+    return v.toFixed(0)
+}
+
+// Sub-components
+function KpiCard({ label, value, sub, change, icon, accent }) {
+    return (
+        <div className="bg-white rounded-2xl border border-slate-100 shadow-sm p-5 relative overflow-hidden group">
+            <div className="flex items-center justify-between mb-3 relative z-10">
+                <p className="text-xs font-bold text-slate-400 uppercase tracking-wider">{label}</p>
+                <div className="p-2 rounded-xl transition-colors" style={{ backgroundColor: `${accent}15`, color: accent }}>
+                    {icon}
+                </div>
+            </div>
+            <p className="text-2xl font-bold text-slate-800 mb-1 relative z-10">{value}</p>
+            <div className="flex items-center gap-2 relative z-10">
+                {change !== undefined && change !== null && (
+                    <span className={`text-xs font-bold flex items-center ${Number(change) >= 0 ? 'text-emerald-500' : 'text-red-500'}`}>
+                        {Number(change) >= 0 ? '↑' : '↓'} {Math.abs(change)}%
+                    </span>
+                )}
+                <p className="text-xs text-slate-400 truncate">{sub}</p>
+            </div>
+            <div className="absolute -right-4 -bottom-4 opacity-5 group-hover:opacity-10 transition-opacity" style={{ color: accent }}>
+                {icon && typeof icon === 'object' && Object.assign({}, icon, { props: { ...icon.props, size: 80 } })}
+            </div>
+        </div>
+    )
+}
+
+const ChartTooltip = ({ active, payload, label }) => {
+    if (active && payload && payload.length) {
+        return (
+            <div className="bg-white/90 backdrop-blur-sm border border-slate-100 p-3 rounded-xl shadow-xl">
+                <p className="text-xs font-bold text-slate-500 mb-2">{label}</p>
+                {payload.map((p, i) => (
+                    <div key={i} className="flex items-center justify-between gap-4 mb-1">
+                        <div className="flex items-center gap-2">
+                            <div className="w-2 h-2 rounded-full" style={{ backgroundColor: p.color }} />
+                            <span className="text-xs text-slate-600">{p.name}</span>
+                        </div>
+                        <span className="text-xs font-bold text-slate-800">{p.value.toFixed(2)} TND</span>
+                    </div>
+                ))}
+            </div>
+        )
+    }
+    return null
+}
 
 export default function Dashboard() {
     const [data, setData] = useState(null)
@@ -24,7 +90,9 @@ export default function Dashboard() {
             { data: productions },
             { data: stock },
             { data: materials },
-            { data: consignments },
+            { data: orderItems },
+            { data: settledConsignments },
+            { data: resellerSales },
         ] = await Promise.all([
             supabase.from('orders').select('id,status,total_price,is_paid,created_at,deadline,type,clients(name)'),
             supabase.from('expenses').select('amount,date,category'),
@@ -33,7 +101,9 @@ export default function Dashboard() {
             supabase.from('productions').select('id,status'),
             supabase.from('stock').select('*,products(name)'),
             supabase.from('materials').select('id,name,quantity_available,low_stock_threshold'),
-            supabase.from('reseller_consignments').select('quantity_sold,unit_price,is_settled'),
+            supabase.from('order_items').select('*'),
+            supabase.from('reseller_consignments').select('id, settled_at').eq('is_settled', true),
+            supabase.from('reseller_sales').select('consignment_id, total, sale_date'),
         ])
 
         const allOrders = orders || []
@@ -41,30 +111,82 @@ export default function Dashboard() {
         const allProds = productions || []
         const allStock = stock || []
         const allMats = materials || []
-        const allConsign = consignments || []
 
-        const revenueThis = allOrders.filter(o => o.is_paid && o.created_at?.startsWith(thisMonth))
-            .reduce((s, o) => s + (o.total_price || 0), 0)
-        const revenueLast = allOrders.filter(o => o.is_paid && o.created_at?.startsWith(lastMonth))
-            .reduce((s, o) => s + (o.total_price || 0), 0)
-        const expThis = allExp.filter(e => e.date?.startsWith(thisMonth))
-            .reduce((s, e) => s + (e.amount || 0), 0)
-        const expLast = allExp.filter(e => e.date?.startsWith(lastMonth))
-            .reduce((s, e) => s + (e.amount || 0), 0)
+        // ── Reseller Revenue Logic (Step 3b Fix) ──────────────────────
+        const allResellerSales = resellerSales || []
 
+        const resellerRevByMonth = {}
+        allResellerSales.forEach(s => {
+            if (!s.sale_date) return
+            const month = s.sale_date.slice(0, 7)
+            resellerRevByMonth[month] = (resellerRevByMonth[month] || 0) + (parseFloat(s.total) || 0)
+        })
+
+        const { data: activeConsignments } = await supabase
+            .from('reseller_consignments')
+            .select('id')
+            .eq('is_settled', false)
+
+        function consignmentTotal(cid) {
+            return allResellerSales
+                .filter(s => s.consignment_id === cid)
+                .reduce((s, sl) => s + (parseFloat(sl.total) || 0), 0)
+        }
+
+        const pendingResellerRev = (activeConsignments || [])
+            .reduce((sum, c) => sum + consignmentTotal(c.id), 0)
+
+        // ── Financials (Step 3c) ──────────────────────────────────────
+        const directRevThis = allOrders.filter(o => o.is_paid && o.created_at?.startsWith(thisMonth)).reduce((s, o) => s + (o.total_price || 0), 0)
+        const directRevLast = allOrders.filter(o => o.is_paid && o.created_at?.startsWith(lastMonth)).reduce((s, o) => s + (o.total_price || 0), 0)
+        const resellerRevThis = resellerRevByMonth[thisMonth] || 0
+        const resellerRevLast = resellerRevByMonth[lastMonth] || 0
+
+        const revThis = directRevThis + resellerRevThis
+        const revLast = directRevLast + resellerRevLast
+        const revChange = revLast > 0 ? (((revThis - revLast) / revLast) * 100).toFixed(0) : null
+
+        const expThis = allExp.filter(e => e.date?.startsWith(thisMonth)).reduce((s, e) => s + (e.amount || 0), 0)
+        const expLast = allExp.filter(e => e.date?.startsWith(lastMonth)).reduce((s, e) => s + (e.amount || 0), 0)
+
+        // ── Chart Data (Step 3d Fix) ──────────────────────────────────
+        const months = []
+        for (let i = 5; i >= 0; i--) {
+            const d = new Date(now.getFullYear(), now.getMonth() - i, 1)
+            months.push({
+                key: d.toISOString().slice(0, 7),
+                label: d.toLocaleDateString('en-GB', { month: 'short' })
+            })
+        }
+
+        const monthlyFinancials = months.map(m => {
+            const directSales = allOrders
+                .filter(o => o.status !== 'cancelled' && o.created_at?.startsWith(m.key))
+                .reduce((s, o) => s + (o.total_price || 0), 0)
+            const resellerRev = resellerRevByMonth[m.key] || 0
+            const totalRev = directSales + resellerRev
+            const exp = allExp.filter(e => e.date?.startsWith(m.key)).reduce((s, e) => s + (e.amount || 0), 0)
+            return {
+                month: m.label,
+                'Direct Sales': parseFloat(directSales.toFixed(2)),
+                'Reseller': parseFloat(resellerRev.toFixed(2)),
+                Revenue: parseFloat(totalRev.toFixed(2)),
+                Expenses: parseFloat(exp.toFixed(2)),
+                Profit: parseFloat((totalRev - exp).toFixed(2)),
+            }
+        })
+
+        // ── Other Stats ──────────────────────────────────────────────
         const activeStatuses = ['new', 'designing', 'quoted', 'confirmed', 'in_production', 'ready', 'delivered', 'waiting_restock']
         const activeOrders = allOrders.filter(o => activeStatuses.includes(o.status))
         const overdueOrders = activeOrders.filter(o => o.deadline && new Date(o.deadline) < new Date())
-        const pendingRev = activeOrders.reduce((s, o) => s + (o.total_price || 0), 0)
+        const pendingRevenue = activeOrders.reduce((s, o) => s + (o.total_price || 0), 0)
 
         const printQueue = allProds.filter(p => p.status === 'queued').length
         const printing = allProds.filter(p => p.status === 'printing').length
 
         const lowStock = allStock.filter(s => s.quantity_available > 0 && s.quantity_available <= 2)
         const lowMaterials = allMats.filter(m => m.quantity_available <= (m.low_stock_threshold || 5))
-
-        const resellerOwes = allConsign.filter(c => !c.is_settled)
-            .reduce((s, c) => s + ((c.quantity_sold || 0) * (c.unit_price || 0)), 0)
 
         const expByCat = allExp.filter(e => e.date?.startsWith(thisMonth))
             .reduce((acc, e) => { acc[e.category] = (acc[e.category] || 0) + e.amount; return acc }, {})
@@ -74,16 +196,19 @@ export default function Dashboard() {
             .slice(0, 5)
 
         setData({
-            revenueThis, revenueLast, expThis, expLast,
-            profitThis: revenueThis - expThis,
-            profitLast: revenueLast - expLast,
-            activeOrders: activeOrders.length, overdueOrders, pendingRev,
+            revThis, revLast, revChange, expThis, expLast,
+            profitThis: revThis - expThis,
+            profitLast: revLast - expLast,
+            activeOrders: activeOrders.length, overdueOrders,
+            pendingRevenue: pendingRevenue + pendingResellerRev,
+            resellerRevThis,
             printQueue, printing,
             lowStock, lowMaterials,
-            resellerOwes, expByCat,
+            expByCat,
             totalClients: clients?.length || 0,
             totalProducts: products?.filter(p => p.is_active).length || 0,
             recent,
+            monthlyFinancials,
         })
         setLoading(false)
     }
@@ -95,9 +220,7 @@ export default function Dashboard() {
     )
 
     const d = data
-    const month = now.toLocaleDateString('en-GB', { month: 'long', year: 'numeric' })
-    const revChange = d.revenueLast > 0
-        ? (((d.revenueThis - d.revenueLast) / d.revenueLast) * 100).toFixed(0) : null
+    const monthName = now.toLocaleDateString('en-GB', { month: 'long', year: 'numeric' })
 
     const STATUS_COLORS = {
         new: 'bg-slate-100 text-slate-600', designing: 'bg-blue-100 text-blue-700',
@@ -110,18 +233,18 @@ export default function Dashboard() {
     const EXP_EMOJI = {
         filament: '🧵',
         electricity: '⚡',
-        material: '🔩',   // was 'tools': '🔧'
+        material: '🔩',
         shipping: '📦',
         other: '💼',
     }
 
     return (
-        <div className="max-w-5xl mx-auto space-y-5">
+        <div className="max-w-5xl mx-auto space-y-5 pb-10">
 
             <div className="flex items-center justify-between">
                 <div>
                     <h1 className="text-2xl font-bold text-slate-800">Dashboard</h1>
-                    <p className="text-sm text-slate-500">{month}</p>
+                    <p className="text-sm text-slate-500">{monthName}</p>
                 </div>
                 <button onClick={fetchAll}
                     className="text-xs text-slate-400 hover:text-sky-500 px-3 py-2 rounded-xl hover:bg-sky-50 transition-colors">
@@ -129,7 +252,7 @@ export default function Dashboard() {
                 </button>
             </div>
 
-            {/* ── QUICK ACTIONS — top ── */}
+            {/* ── QUICK ACTIONS ── */}
             <div>
                 <p className="text-xs font-bold text-slate-400 uppercase tracking-wider mb-3">Quick Actions</p>
                 <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
@@ -176,150 +299,142 @@ export default function Dashboard() {
                             <ArrowRight size={16} className="text-amber-400" />
                         </div>
                     )}
+                </div>
+            )}
+
+            {/* ── KPI GRID (Step 3g) ── */}
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                <KpiCard
+                    label="Revenue"
+                    value={`${fmtShort(d.revThis)} TND`}
+                    sub={d.resellerRevThis > 0
+                        ? `incl. ${fmtShort(d.resellerRevThis)} TND reseller`
+                        : 'vs last month'}
+                    change={d.revChange}
+                    icon={<TrendingUp size={16} />}
+                    accent={C.emerald} />
+
+                <KpiCard
+                    label="Expenses"
+                    value={`${fmtShort(d.expThis)} TND`}
+                    sub={Object.entries(d.expByCat).map(([c, v]) => `${EXP_EMOJI[c] || ''}${v.toFixed(0)}`).join(' ')}
+                    icon={<TrendingDown size={16} />}
+                    accent={C.red} />
+
+                <KpiCard
+                    label="Net Profit"
+                    value={`${fmtShort(d.profitThis)} TND`}
+                    sub={`Margin: ${d.revThis > 0 ? (d.profitThis / d.revThis * 100).toFixed(0) : 0}%`}
+                    icon={<DollarSign size={16} />}
+                    accent={C.sky} />
+            </div>
+
+            {/* ── REVENUE VS EXPENSES CHART (Step 3f) ── */}
+            <div className="bg-white rounded-2xl border border-slate-100 shadow-sm p-5">
+                <div className="flex items-center justify-between mb-6">
+                    <div>
+                        <h2 className="font-bold text-slate-800">Financial Overview</h2>
+                        <p className="text-xs text-slate-400">Monthly revenue split and expenses</p>
+                    </div>
+                    {d.pendingRevenue > 0 && (
+                        <div className="bg-amber-50 px-3 py-1 rounded-lg">
+                            <p className="text-[10px] font-bold text-amber-600 uppercase">Pending</p>
+                            <p className="text-xs font-bold text-amber-700">{d.pendingRevenue.toFixed(0)} TND</p>
+                        </div>
+                    )}
+                </div>
+                <div className="h-64 w-full">
+                    <ResponsiveContainer width="100%" height="100%">
+                        <BarChart data={d.monthlyFinancials} barGap={4}
+                            margin={{ top: 5, right: 10, left: 0, bottom: 0 }}>
+                            <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" vertical={false} />
+                            <XAxis dataKey="month" tick={{ fontSize: 11, fill: '#94a3b8' }} axisLine={false} tickLine={false} />
+                            <YAxis tick={{ fontSize: 11, fill: '#94a3b8' }} axisLine={false} tickLine={false}
+                                tickFormatter={v => `${fmtShort(v)}`} />
+                            <Tooltip content={<ChartTooltip />} cursor={{ fill: '#f8fafc' }} />
+                            <Legend iconType="circle" iconSize={8}
+                                wrapperStyle={{ fontSize: 11, color: '#94a3b8', paddingTop: 12 }} />
+                            <Bar dataKey="Direct Sales" stackId="rev" fill={C.emerald} radius={[0, 0, 0, 0]} maxBarSize={32} />
+                            <Bar dataKey="Reseller" stackId="rev" fill={C.teal} radius={[6, 6, 0, 0]} maxBarSize={32} />
+                            <Bar dataKey="Expenses" fill={C.red} radius={[6, 6, 0, 0]} maxBarSize={32} />
+                        </BarChart>
+                    </ResponsiveContainer>
+                </div>
+            </div>
+
+            {/* ── OPERATIONS & RECENT ORDERS ── */}
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-5">
+                <div className="md:col-span-1 space-y-3">
+                    <p className="text-xs font-bold text-slate-400 uppercase tracking-wider">Operations</p>
+                    <div className="grid grid-cols-2 gap-3">
+                        {[
+                            { label: 'Orders', value: d.activeOrders, icon: <ShoppingCart size={20} className="text-sky-500" />, path: '/orders' },
+                            { label: 'Printing', value: d.printing, icon: <Printer size={20} className="text-yellow-500" />, path: '/productions' },
+                            { label: 'Clients', value: d.totalClients, icon: <Users size={20} className="text-purple-500" />, path: '/clients' },
+                            { label: 'Products', value: d.totalProducts, icon: <Package size={20} className="text-emerald-500" />, path: '/products' },
+                        ].map(c => (
+                            <div key={c.label} onClick={() => navigate(c.path)}
+                                className="bg-white rounded-2xl border border-slate-100 p-4 cursor-pointer hover:shadow-md transition-all">
+                                <div className="flex items-center gap-3">
+                                    <div className="p-2 bg-slate-50 rounded-lg">{c.icon}</div>
+                                    <div>
+                                        <p className="text-xl font-bold text-slate-800 leading-none">{c.value}</p>
+                                        <p className="text-[10px] font-medium text-slate-400 uppercase mt-1">{c.label}</p>
+                                    </div>
+                                </div>
+                            </div>
+                        ))}
+                    </div>
+
                     {d.lowMaterials.length > 0 && (
                         <div onClick={() => navigate('/materials')}
-                            className="flex items-center gap-3 bg-orange-50 border border-orange-200 rounded-2xl p-4 cursor-pointer hover:bg-orange-100 transition-colors">
-                            <Package size={18} className="text-orange-500 flex-shrink-0" />
+                            className="bg-orange-50 border border-orange-200 rounded-2xl p-4 cursor-pointer hover:bg-orange-100 transition-colors flex items-center gap-3">
+                            <Package size={18} className="text-orange-500" />
                             <div className="flex-1">
-                                <p className="text-sm font-bold text-orange-700">
-                                    Low supply on {d.lowMaterials.length} material{d.lowMaterials.length > 1 ? 's' : ''}
-                                </p>
-                                <p className="text-xs text-orange-500">{d.lowMaterials.map(m => m.name).join(', ')}</p>
+                                <p className="text-xs font-bold text-orange-700">Low on {d.lowMaterials.length} materials</p>
                             </div>
-                            <ArrowRight size={16} className="text-orange-400" />
+                            <ArrowRight size={14} className="text-orange-400" />
                         </div>
                     )}
                 </div>
-            )}
 
-            {/* ── REVENUE / EXPENSES / PROFIT ── */}
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-                <div className="bg-white rounded-2xl border border-slate-100 shadow-sm p-5">
-                    <div className="flex items-center justify-between mb-3">
-                        <div>
-                            <p className="text-xs font-medium text-slate-500">Revenue</p>
-                            <p className="text-xs text-slate-400">{month}</p>
+                <div className="md:col-span-2">
+                    <div className="bg-white rounded-2xl border border-slate-100 shadow-sm p-5 h-full">
+                        <div className="flex items-center justify-between mb-4">
+                            <h2 className="font-bold text-slate-800">Recent Orders</h2>
+                            <button onClick={() => navigate('/orders')}
+                                className="text-xs text-sky-500 hover:text-sky-700 font-medium">View all →</button>
                         </div>
-                        <div className="p-2 bg-emerald-50 rounded-xl">
-                            <TrendingUp size={18} className="text-emerald-600" />
-                        </div>
-                    </div>
-                    <p className="text-2xl font-bold text-emerald-600 mb-1">{d.revenueThis.toFixed(2)} TND</p>
-                    {revChange !== null && (
-                        <p className={`text-xs font-medium ${Number(revChange) >= 0 ? 'text-emerald-500' : 'text-red-500'}`}>
-                            {Number(revChange) >= 0 ? '↑' : '↓'} {Math.abs(revChange)}% vs last month
-                        </p>
-                    )}
-                    {d.pendingRev > 0 && <p className="text-xs text-amber-500 mt-1">+ {d.pendingRev.toFixed(2)} TND pending</p>}
-                </div>
-
-                <div className="bg-white rounded-2xl border border-slate-100 shadow-sm p-5">
-                    <div className="flex items-center justify-between mb-3">
-                        <div>
-                            <p className="text-xs font-medium text-slate-500">Expenses</p>
-                            <p className="text-xs text-slate-400">{month}</p>
-                        </div>
-                        <div className="p-2 bg-red-50 rounded-xl">
-                            <TrendingDown size={18} className="text-red-500" />
-                        </div>
-                    </div>
-                    <p className="text-2xl font-bold text-red-500 mb-2">{d.expThis.toFixed(2)} TND</p>
-                    <div className="flex flex-wrap gap-1">
-                        {Object.entries(d.expByCat).map(([cat, amt]) => (
-                            <span key={cat} className="text-xs bg-slate-50 text-slate-500 px-2 py-0.5 rounded-lg">
-                                {EXP_EMOJI[cat] || '💼'} {amt.toFixed(0)}
-                            </span>
-                        ))}
-                    </div>
-                </div>
-
-                <div className={`rounded-2xl border shadow-sm p-5
-          ${d.profitThis >= 0 ? 'bg-sky-50 border-sky-200' : 'bg-red-50 border-red-200'}`}>
-                    <div className="flex items-center justify-between mb-3">
-                        <div>
-                            <p className="text-xs font-medium text-slate-500">Net Profit</p>
-                            <p className="text-xs text-slate-400">{month}</p>
-                        </div>
-                        <div className={`p-2 rounded-xl ${d.profitThis >= 0 ? 'bg-sky-100' : 'bg-red-100'}`}>
-                            {d.profitThis >= 0
-                                ? <TrendingUp size={18} className="text-sky-600" />
-                                : <TrendingDown size={18} className="text-red-500" />}
-                        </div>
-                    </div>
-                    <p className={`text-2xl font-bold mb-1 ${d.profitThis >= 0 ? 'text-sky-700' : 'text-red-600'}`}>
-                        {d.profitThis.toFixed(2)} TND
-                    </p>
-                    {d.profitLast !== 0 && (
-                        <p className="text-xs text-slate-400">Last month: {d.profitLast.toFixed(2)} TND</p>
-                    )}
-                </div>
-            </div>
-
-            {/* ── OPERATIONS ── */}
-            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-                {[
-                    { label: 'Active Orders', value: d.activeOrders, icon: <ShoppingCart size={22} className="mx-auto text-sky-500 mb-2" />, path: '/orders' },
-                    { label: 'Printing Now', value: d.printing, icon: <Printer size={22} className="mx-auto text-yellow-500 mb-2" />, path: '/productions' },
-                    { label: 'Clients', value: d.totalClients, icon: <Users size={22} className="mx-auto text-purple-500 mb-2" />, path: '/clients' },
-                    { label: 'Products', value: d.totalProducts, icon: <Package size={22} className="mx-auto text-emerald-500 mb-2" />, path: '/products' },
-                ].map(c => (
-                    <div key={c.path} onClick={() => navigate(c.path)}
-                        className="bg-white rounded-2xl border border-slate-100 shadow-sm p-4 cursor-pointer hover:shadow-md transition-all text-center">
-                        {c.icon}
-                        <p className="text-2xl font-bold text-slate-800">{c.value}</p>
-                        <p className="text-xs text-slate-400">{c.label}</p>
-                    </div>
-                ))}
-            </div>
-
-            {/* ── RESELLER BALANCE ── */}
-            {d.resellerOwes > 0 && (
-                <div onClick={() => navigate('/reseller')}
-                    className="bg-gradient-to-r from-purple-500 to-purple-700 rounded-2xl p-4 cursor-pointer hover:opacity-95 flex items-center justify-between text-white">
-                    <div>
-                        <p className="text-sm font-bold">🤝 Reseller owes you</p>
-                        <p className="text-xs text-purple-200">Tap to view and settle</p>
-                    </div>
-                    <div className="text-right">
-                        <p className="text-2xl font-bold">{d.resellerOwes.toFixed(2)} TND</p>
-                    </div>
-                </div>
-            )}
-
-            {/* ── RECENT ORDERS ── */}
-            <div className="bg-white rounded-2xl border border-slate-100 shadow-sm p-5">
-                <div className="flex items-center justify-between mb-4">
-                    <h2 className="font-bold text-slate-800">Recent Orders</h2>
-                    <button onClick={() => navigate('/orders')}
-                        className="text-xs text-sky-500 hover:text-sky-700 font-medium">View all →</button>
-                </div>
-                {d.recent.length === 0 ? (
-                    <p className="text-sm text-slate-400 text-center py-6">No orders yet</p>
-                ) : (
-                    <div className="space-y-2">
-                        {d.recent.map(o => (
-                            <div key={o.id} onClick={() => navigate('/orders')}
-                                className="flex items-center justify-between py-2.5 px-3 rounded-xl hover:bg-slate-50 cursor-pointer transition-colors">
-                                <div className="flex-1 min-w-0">
-                                    <div className="flex items-center gap-2 mb-0.5">
-                                        <p className="text-sm font-medium text-slate-800">{o.clients?.name || '—'}</p>
-                                        <span className={`text-xs px-1.5 py-0.5 rounded-full font-medium
-                      ${o.type === 'custom' ? 'bg-violet-100 text-violet-600' : 'bg-teal-100 text-teal-600'}`}>
-                                            {o.type}
-                                        </span>
+                        {d.recent.length === 0 ? (
+                            <p className="text-sm text-slate-400 text-center py-6">No orders yet</p>
+                        ) : (
+                            <div className="space-y-2">
+                                {d.recent.map(o => (
+                                    <div key={o.id} onClick={() => navigate('/orders')}
+                                        className="flex items-center justify-between py-2.5 px-3 rounded-xl hover:bg-slate-50 cursor-pointer transition-colors">
+                                        <div className="flex-1 min-w-0">
+                                            <div className="flex items-center gap-2 mb-0.5">
+                                                <p className="text-sm font-medium text-slate-800 truncate">{o.clients?.name || '—'}</p>
+                                                <span className={`text-[10px] px-1.5 py-0.5 rounded-full font-bold uppercase
+                          ${o.type === 'custom' ? 'bg-violet-100 text-violet-600' : 'bg-teal-100 text-teal-600'}`}>
+                                                    {o.type}
+                                                </span>
+                                            </div>
+                                            <span className={`text-[10px] px-2 py-0.5 rounded-full font-bold uppercase ${STATUS_COLORS[o.status] || ''}`}>
+                                                {o.status.replace('_', ' ')}
+                                            </span>
+                                        </div>
+                                        <p className="font-bold text-slate-700 text-sm ml-3 whitespace-nowrap">
+                                            {o.total_price ? `${o.total_price.toFixed(2)} TND` : 'TBD'}
+                                        </p>
                                     </div>
-                                    <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${STATUS_COLORS[o.status] || ''}`}>
-                                        {o.status}
-                                    </span>
-                                </div>
-                                <p className="font-semibold text-slate-700 text-sm ml-3">
-                                    {o.total_price ? `${o.total_price} TND` : <span className="text-slate-300">TBD</span>}
-                                </p>
+                                ))}
                             </div>
-                        ))}
+                        )}
                     </div>
-                )}
+                </div>
             </div>
+
         </div>
     )
 }
