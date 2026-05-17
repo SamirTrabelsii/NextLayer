@@ -707,7 +707,7 @@ export default function Orders() {
         setError('')
         try {
             const client = clients.find(c => c.id === form.client_id)
-            const validItems = items.filter(i => i.product_id || i.custom_description.trim())
+            const validItems = items.filter(i => i.product_id || i.custom_description?.trim())
 
             // If backdated, we inject created_at — everything else is identical
             const backdatedCreatedAt = form.isBackdated && form.orderDate
@@ -1717,7 +1717,7 @@ export default function Orders() {
                                 Cancel
                             </button>
                             <button onClick={saveOrder}
-                                disabled={saving || !form.client_id || (form.type === 'custom' && !form.custom_description.trim()) || (form.isBackdated && !form.orderDate)}
+                                disabled={saving || !form.client_id || (form.type === 'custom' && !form.custom_description?.trim()) || (form.isBackdated && !form.orderDate)}
                                 className={`flex-1 py-3 disabled:opacity-50 text-white rounded-xl text-sm font-semibold transition-colors
                                     ${form.isBackdated ? 'bg-amber-500 hover:bg-amber-600' : 'bg-sky-500 hover:bg-sky-600'}`}>
                                 {saving ? 'Creating...' : form.isBackdated ? '🕐 Create Backdated Order' : 'Create Order'}
