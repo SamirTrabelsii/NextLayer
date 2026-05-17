@@ -2,8 +2,10 @@ import { useState, useEffect, useCallback } from 'react'
 import { supabase } from '../lib/supabase'
 import {
     Plus, X, Search, ChevronRight, Trash2,
-    ArrowRight, Phone, UserPlus, PackagePlus, AlertTriangle
+    ArrowRight, Phone, UserPlus, PackagePlus, AlertTriangle, Box, Download
 } from 'lucide-react'
+import ImageUpload from '../components/ImageUpload'
+import StlUpload from '../components/StlUpload'
 
 // ─── CONSTANTS ────────────────────────────────────────────────
 const STATUSES = [
@@ -38,7 +40,7 @@ const getNextStatus = (order) => {
 }
 
 // ─── EMPTY FORMS ──────────────────────────────────────────────
-const emptyForm = { type: 'custom', client_id: '', custom_description: '', dimensions: '', reference_notes: '', deadline: '', total_price: '', notes: '', status: 'new' }
+const emptyForm = { type: 'custom', client_id: '', custom_description: '', dimensions: '', reference_notes: '', deadline: '', total_price: '', notes: '', status: 'new', reference_image_url: '', stl_url: '' }
 const emptyItem = { product_id: '', custom_description: '', quantity: 1, unit_price: '' }
 const emptyClient = { name: '', phone: '', email: '' }
 const emptyProduct = { name: '', category: 'Custom Orders', selling_price: '', production_cost: '' }
@@ -326,7 +328,7 @@ export default function Orders() {
             const [{ data: o, error: e1 }, { data: c }, { data: p }] = await Promise.all([
                 supabase.from('orders').select(`
           id, type, status, total_price, is_paid, deadline, notes,
-          custom_description, dimensions, reference_notes, created_at,
+          custom_description, dimensions, reference_notes, reference_image_url, stl_url, created_at,
           clients(id, name, phone),
           order_items(id, quantity, unit_price, custom_description, product_id, products(id, name))
         `).order('created_at', { ascending: false }),
@@ -704,6 +706,8 @@ export default function Orders() {
                     custom_description: form.type === 'custom' ? form.custom_description : null,
                     dimensions: form.type === 'custom' ? form.dimensions : null,
                     reference_notes: form.type === 'custom' ? form.reference_notes : null,
+                    reference_image_url: form.type === 'custom' ? (form.reference_image_url || null) : null,
+                    stl_url: form.type === 'custom' ? (form.stl_url || null) : null,
                     is_paid: false,
                 }])
                 .select().single()
@@ -785,6 +789,8 @@ export default function Orders() {
             custom_description: editForm.custom_description || null,
             dimensions: editForm.dimensions || null,
             reference_notes: editForm.reference_notes || null,
+            reference_image_url: editForm.reference_image_url || null,
+            stl_url: editForm.stl_url || null,
         }
         const { error } = await supabase.from('orders')
             .update(payload).eq('id', selected.id)
@@ -1380,6 +1386,30 @@ export default function Orders() {
                                             rows={2}
                                             className="w-full border-2 border-slate-200 focus:border-sky-400 rounded-xl px-3 py-2.5 text-sm outline-none resize-none transition-colors" />
                                     </div>
+
+                                    {/* Reference image from client */}
+                                    <ImageUpload
+                                        folder="orders/images"
+                                        value={form.reference_image_url || ''}
+                                        onChange={url => setForm(f => ({ ...f, reference_image_url: url }))}
+                                        label={
+                                            <span>
+                                                Reference Image
+                                                <span className="text-slate-400 font-normal ml-1">— photo sent by the client</span>
+                                            </span>
+                                        } />
+
+                                    {/* STL file if you already have the design */}
+                                    <StlUpload
+                                        folder="orders/stl"
+                                        value={form.stl_url || ''}
+                                        onChange={url => setForm(f => ({ ...f, stl_url: url }))}
+                                        label={
+                                            <span>
+                                                STL File
+                                                <span className="text-slate-400 font-normal ml-1">— optional, add when ready</span>
+                                            </span>
+                                        } />
                                     <div className="bg-violet-50 border border-violet-200 rounded-xl p-3">
                                         <p className="text-xs text-violet-700 font-medium">
                                             🖨️ A print job will be automatically queued for this order
@@ -1635,6 +1665,8 @@ export default function Orders() {
                                             custom_description: selected.custom_description || '',
                                             dimensions: selected.dimensions || '',
                                             reference_notes: selected.reference_notes || '',
+                                            reference_image_url: selected.reference_image_url || '',
+                                            stl_url: selected.stl_url || '',
                                         })
                                         setEditingOrder(true)
                                     }}
@@ -1722,6 +1754,22 @@ export default function Orders() {
                                             placeholder="Internal notes..."
                                             className="w-full border border-slate-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-sky-300 bg-white resize-none" />
                                     </div>
+
+                                    {selected.type === 'custom' && (
+                                        <div className="space-y-3 pt-1">
+                                            <ImageUpload
+                                                folder="orders/images"
+                                                value={editForm.reference_image_url || selected.reference_image_url || ''}
+                                                onChange={url => setEditForm(f => ({ ...f, reference_image_url: url }))}
+                                                label="Reference Image" />
+
+                                            <StlUpload
+                                                folder="orders/stl"
+                                                value={editForm.stl_url || selected.stl_url || ''}
+                                                onChange={url => setEditForm(f => ({ ...f, stl_url: url }))}
+                                                label="STL File" />
+                                        </div>
+                                    )}
 
                                     <div className="flex gap-2 pt-1">
                                         <button onClick={() => setEditingOrder(false)}
@@ -1817,6 +1865,36 @@ export default function Orders() {
                                     <p className="text-xs font-bold text-amber-600 mb-1">🗒️ Reference / Instructions</p>
                                     <p className="text-sm text-slate-700">{selected.reference_notes}</p>
                                 </div>
+                            )}
+
+                            {/* Reference image */}
+                            {selected.reference_image_url && (
+                                <div>
+                                    <p className="text-xs font-bold text-slate-400 uppercase tracking-wider mb-2">
+                                        📸 Client Reference Image
+                                    </p>
+                                    <div className="rounded-xl overflow-hidden border border-slate-200">
+                                        <img
+                                            src={selected.reference_image_url}
+                                            alt="Reference"
+                                            className="w-full max-h-64 object-contain bg-slate-50" />
+                                    </div>
+                                </div>
+                            )}
+
+                            {/* STL file */}
+                            {selected.stl_url && (
+                                <a href={selected.stl_url} download target="_blank" rel="noreferrer"
+                                    className="flex items-center gap-3 bg-violet-50 border border-violet-200 rounded-xl px-4 py-3 hover:bg-violet-100 transition-colors">
+                                    <div className="p-2 bg-violet-100 rounded-lg">
+                                        <Box size={16} className="text-violet-600" />
+                                    </div>
+                                    <div className="flex-1 min-w-0">
+                                        <p className="text-sm font-semibold text-violet-700">STL File</p>
+                                        <p className="text-xs text-violet-400">Click to download design file</p>
+                                    </div>
+                                    <Download size={16} className="text-violet-500 flex-shrink-0" />
+                                </a>
                             )}
 
                             {/* Standard items */}

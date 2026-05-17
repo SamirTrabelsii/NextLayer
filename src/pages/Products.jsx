@@ -1,7 +1,9 @@
 import { useState, useEffect } from 'react'
 import { supabase } from '../lib/supabase'
-import { Plus, Pencil, Trash2, Search, X, Package } from 'lucide-react'
+import { Plus, Pencil, Trash2, Search, X, Package, Box } from 'lucide-react'
 import { useSettings } from '../lib/SettingsContext'
+import ImageUpload from '../components/ImageUpload'
+import StlUpload from '../components/StlUpload'
 
 const CATEGORIES = ['All', 'Keychains', 'Clickers', 'Decorations', 'Custom Orders']
 const MATERIALS = ['PLA', 'PETG', 'ABS', 'TPU', 'Resin', 'Other']
@@ -10,6 +12,7 @@ const empty = {
     name: '', category: 'Keychains', material: 'PLA', color: '',
     print_time_hours: '', filament_grams: '', production_cost: '',
     selling_price: '', description: '', is_active: true,
+    image_url: '', stl_url: '',   // ← add these
 }
 
 export default function Products() {
@@ -41,7 +44,11 @@ export default function Products() {
         setLoading(false)
     }
     async function openEdit(p) {
-        setForm({ ...p })
+        setForm({
+            ...p,
+            image_url: p.image_url || '',
+            stl_url: p.stl_url || '',
+        })
         setEditing(p.id)
         // Load existing BOM
         const { data: bom } = await supabase
@@ -208,13 +215,30 @@ export default function Products() {
                     {filtered.map(p => (
                         <div key={p.id} className={`bg-white rounded-2xl border p-4 shadow-sm hover:shadow-md transition-shadow
               ${!p.is_active ? 'opacity-50' : ''}`}>
+
+                            {/* Product image */}
+                            {p.image_url && (
+                                <div className="mb-3 -mx-4 -mt-4 rounded-t-2xl overflow-hidden">
+                                    <img src={p.image_url} alt={p.name}
+                                        className="w-full h-36 object-cover" />
+                                </div>
+                            )}
+
                             <div className="flex items-start justify-between mb-3">
                                 <div>
-                                    <span className="text-xs font-medium text-sky-600 bg-sky-50 px-2 py-0.5 rounded-full">
-                                        {p.category}
-                                    </span>
-                                    <h3 className="font-semibold text-slate-800 mt-1">{p.name}</h3>
-                                    <p className="text-xs text-slate-400">{p.material} {p.color ? `· ${p.color}` : ''}</p>
+                                    <div className="flex items-center gap-2 mb-1">
+                                        <span className="text-xs font-medium text-sky-600 bg-sky-50 px-2 py-0.5 rounded-full">
+                                            {p.category}
+                                        </span>
+                                        {p.stl_url && (
+                                            <a href={p.stl_url} download target="_blank" rel="noreferrer"
+                                                className="text-xs font-medium text-violet-600 bg-violet-50 px-2 py-0.5 rounded-full hover:bg-violet-100 transition-colors flex items-center gap-1">
+                                                <Box size={10} /> STL
+                                            </a>
+                                        )}
+                                    </div>
+                                    <h3 className="font-semibold text-slate-800">{p.name}</h3>
+                                    <p className="text-xs text-slate-400">{p.material}{p.color ? ` · ${p.color}` : ''}</p>
                                 </div>
                                 <div className="flex gap-1">
                                     <button onClick={() => openEdit(p)}
@@ -430,6 +454,19 @@ export default function Products() {
                                     rows={2}
                                     className="w-full border border-slate-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-sky-300 resize-none" />
                             </div>
+                            {/* Image upload */}
+                            <ImageUpload
+                                folder="products/images"
+                                value={form.image_url}
+                                onChange={url => setForm(f => ({ ...f, image_url: url }))}
+                                label="Product Photo" />
+
+                            {/* STL file upload */}
+                            <StlUpload
+                                folder="products/stl"
+                                value={form.stl_url}
+                                onChange={url => setForm(f => ({ ...f, stl_url: url }))}
+                                label="STL File" />
 
                             {/* Active toggle */}
                             <label className="flex items-center gap-3 cursor-pointer">
