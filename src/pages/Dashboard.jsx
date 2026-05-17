@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react'
 import { supabase } from '../lib/supabase'
 import { useNavigate } from 'react-router-dom'
+import { useTheme } from '../lib/ThemeContext'
 import { TrendingUp, TrendingDown, ShoppingCart, Users, Package, Printer, AlertCircle, ArrowRight, DollarSign } from 'lucide-react'
 import {
     BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer
@@ -73,6 +74,7 @@ export default function Dashboard() {
     const [data, setData] = useState(null)
     const [loading, setLoading] = useState(true)
     const navigate = useNavigate()
+    const { isDark } = useTheme()
 
     const now = new Date()
     // Use local-timezone month keys (toISOString() is UTC and shifts months for UTC+ timezones)
@@ -355,13 +357,13 @@ export default function Dashboard() {
                     <ResponsiveContainer width="100%" height="100%">
                         <BarChart data={d.monthlyFinancials} barGap={4}
                             margin={{ top: 5, right: 10, left: 0, bottom: 0 }}>
-                            <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" vertical={false} />
-                            <XAxis dataKey="month" tick={{ fontSize: 11, fill: '#94a3b8' }} axisLine={false} tickLine={false} />
-                            <YAxis tick={{ fontSize: 11, fill: '#94a3b8' }} axisLine={false} tickLine={false}
+                            <CartesianGrid strokeDasharray="3 3" stroke={isDark ? '#1e293b' : '#f1f5f9'} vertical={false} />
+                            <XAxis dataKey="month" tick={{ fontSize: 11, fill: isDark ? '#64748b' : '#94a3b8' }} axisLine={false} tickLine={false} />
+                            <YAxis tick={{ fontSize: 11, fill: isDark ? '#64748b' : '#94a3b8' }} axisLine={false} tickLine={false}
                                 tickFormatter={v => `${fmtShort(v)}`} />
-                            <Tooltip content={<ChartTooltip />} cursor={{ fill: '#f8fafc' }} />
+                            <Tooltip content={<ChartTooltip />} cursor={{ fill: isDark ? 'rgba(30, 41, 59, 0.3)' : '#f8fafc' }} />
                             <Legend iconType="circle" iconSize={8}
-                                wrapperStyle={{ fontSize: 11, color: '#94a3b8', paddingTop: 12 }} />
+                                wrapperStyle={{ fontSize: 11, color: isDark ? '#64748b' : '#94a3b8', paddingTop: 12 }} />
                             <Bar dataKey="Direct Sales" stackId="rev" fill={C.emerald} radius={[0, 0, 0, 0]} maxBarSize={32} />
                             <Bar dataKey="Reseller" stackId="rev" fill={C.teal} radius={[6, 6, 0, 0]} maxBarSize={32} />
                             <Bar dataKey="Expenses" fill={C.red} radius={[6, 6, 0, 0]} maxBarSize={32} />

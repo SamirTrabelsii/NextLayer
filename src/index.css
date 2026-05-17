@@ -9,4 +9,175 @@
 body {
   font-family: 'Inter', system-ui, sans-serif;
   background-color: #f8fafc;
+  transition: background-color 0.25s ease-out, color 0.2s ease-out;
+}
+
+/* Smooth transition when toggling dark mode */
+body, 
+aside, 
+nav, 
+.bg-white, 
+.border-slate-100, 
+.border-slate-200, 
+input, 
+select, 
+textarea, 
+button {
+  transition: background-color 0.25s ease-out, border-color 0.25s ease-out, color 0.2s ease-out;
+}
+
+/* ==========================================================================
+   GLOBAL DARK MODE OVERRIDES (.dark)
+   ========================================================================== */
+
+.dark body {
+  background-color: #0b0f19;
+  color: #f1f5f9;
+}
+
+/* Main layouts and cards */
+.dark .bg-slate-50 {
+  background-color: #0b0f19 !important;
+}
+
+.dark .bg-white {
+  background-color: #121b2c !important;
+}
+
+.dark .bg-white\/90 {
+  background-color: rgba(18, 27, 44, 0.9) !important;
+}
+
+.dark .border-slate-100,
+.dark .border-slate-200 {
+  border-color: #1e293b !important;
+}
+
+.dark .border-t,
+.dark .border-b,
+.dark .border-l,
+.dark .border-r {
+  border-color: #1e293b !important;
+}
+
+/* Text coloring overrides */
+.dark .text-slate-900,
+.dark .text-slate-800 {
+  color: #f1f5f9 !important;
+}
+
+.dark .text-slate-700 {
+  color: #e2e8f0 !important;
+}
+
+.dark .text-slate-600 {
+  color: #cbd5e1 !important;
+}
+
+.dark .text-slate-500 {
+  color: #94a3b8 !important;
+}
+
+.dark .text-slate-400 {
+  color: #64748b !important;
+}
+
+/* Form Controls (Inputs, Selects, Textareas, Date-pickers) */
+.dark input, 
+.dark select, 
+.dark textarea {
+  background-color: #172237 !important;
+  border-color: #25354e !important;
+  color: #f8fafc !important;
+}
+
+.dark input::placeholder, 
+.dark textarea::placeholder {
+  color: #475569 !important;
+}
+
+.dark input:focus,
+.dark select:focus,
+.dark textarea:focus {
+  border-color: #0ea5e9 !important;
+  --tw-ring-color: rgba(14, 165, 233, 0.4) !important;
+  outline: 2px solid transparent !important;
+  outline-offset: 2px !important;
+}
+
+/* Dynamic Badge Overrides for Modern Glowing Aesthetic */
+.dark .bg-slate-100 { background-color: #1e293b !important; color: #cbd5e1 !important; }
+.dark .bg-blue-100 { background-color: rgba(30, 58, 138, 0.3) !important; color: #93c5fd !important; }
+.dark .bg-purple-100 { background-color: rgba(88, 28, 135, 0.3) !important; color: #d8b4fe !important; }
+.dark .bg-sky-100 { background-color: rgba(12, 74, 110, 0.3) !important; color: #7dd3fc !important; }
+.dark .bg-yellow-100 { background-color: rgba(113, 63, 18, 0.3) !important; color: #fde047 !important; }
+.dark .bg-pink-100 { background-color: rgba(131, 24, 67, 0.3) !important; color: #fbcfe8 !important; }
+.dark .bg-orange-100 { background-color: rgba(124, 45, 18, 0.3) !important; color: #ffedd5 !important; }
+.dark .bg-indigo-100 { background-color: rgba(49, 16, 143, 0.3) !important; color: #c7d2fe !important; }
+.dark .bg-emerald-100 { background-color: rgba(6, 78, 59, 0.3) !important; color: #6ee7b7 !important; }
+.dark .bg-red-100 { background-color: rgba(127, 29, 29, 0.3) !important; color: #fca5a5 !important; }
+.dark .bg-violet-100 { background-color: rgba(109, 40, 217, 0.3) !important; color: #ddd6fe !important; }
+.dark .bg-teal-100 { background-color: rgba(15, 118, 110, 0.3) !important; color: #99f6e4 !important; }
+
+/* Interactive Hover States */
+.dark .hover\:bg-slate-50:hover {
+  background-color: #172237 !important;
+}
+
+.dark .hover\:bg-sky-50:hover, 
+.dark .bg-sky-50 {
+  background-color: rgba(14, 165, 233, 0.1) !important;
+}
+
+/* Alert Boxes Adaptation */
+.dark .bg-red-50 {
+  background-color: rgba(127, 29, 29, 0.15) !important;
+  border-color: rgba(239, 68, 68, 0.2) !important;
+}
+.dark .text-red-700 { color: #f87171 !important; }
+.dark .text-red-600 { color: #fca5a5 !important; }
+.dark .text-red-500 { color: #fca5a5 !important; }
+
+.dark .bg-amber-50 {
+  background-color: rgba(120, 53, 15, 0.15) !important;
+  border-color: rgba(245, 158, 11, 0.2) !important;
+}
+.dark .text-amber-700 { color: #fbbf24 !important; }
+.dark .text-amber-600 { color: #fde047 !important; }
+
+.dark .bg-orange-50 {
+  background-color: rgba(124, 45, 18, 0.15) !important;
+  border-color: rgba(249, 115, 22, 0.2) !important;
+}
+.dark .text-orange-700 { color: #fdba74 !important; }
+
+/* Mobile Bottom Navigation Override */
+.dark nav.md\:hidden {
+  background-color: #121b2c !important;
+  border-top-color: #1e293b !important;
+}
+
+.dark nav.md\:hidden .text-sky-500.bg-sky-50 {
+  background-color: rgba(14, 165, 233, 0.1) !important;
+  color: #0ea5e9 !important;
+}
+
+/* Custom premium scrollbar */
+.dark ::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+.dark ::-webkit-scrollbar-track {
+  background: #0b0f19;
+}
+
+.dark ::-webkit-scrollbar-thumb {
+  background: #1e293b;
+  border-radius: 9999px;
+  border: 2px solid #0b0f19;
+}
+
+.dark ::-webkit-scrollbar-thumb:hover {
+  background: #334155;
 }
