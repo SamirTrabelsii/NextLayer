@@ -40,8 +40,17 @@ const getNextStatus = (order) => {
 }
 
 // ─── EMPTY FORMS ──────────────────────────────────────────────
-const emptyForm = { type: 'custom', client_id: '', custom_description: '', dimensions: '', reference_notes: '', deadline: '', total_price: '', notes: '', status: 'new', reference_image_url: '', stl_url: '' }
-const emptyItem = { product_id: '', custom_description: '', quantity: 1, unit_price: '' }
+const emptyForm = {
+    type: 'custom', client_id: '', custom_description: '',
+    dimensions: '', reference_notes: '', deadline: '',
+    total_price: '', notes: '', status: 'new',
+    reference_image_url: '', stl_url: '',
+    // Backdated entry — only affects created_at, everything else is normal
+    isBackdated: false,
+    orderDate: '',
+}
+// Standard orders: no custom_description, product_id required
+const emptyItem = { product_id: '', quantity: 1, unit_price: '' }
 const emptyClient = { name: '', phone: '', email: '' }
 const emptyProduct = { name: '', category: 'Custom Orders', selling_price: '', production_cost: '' }
 const CATEGORIES = ['Keychains', 'Clickers', 'Decorations', 'Custom Orders']
@@ -96,6 +105,12 @@ export default function Orders() {
     const [productionForm, setProductionForm] = useState({ price: '', filament_grams: '', print_time_hours: '', actual_cost: '' })
     const [productionFormError, setProductionFormError] = useState('')
     const [savingProduction, setSavingProduction] = useState(false)
+
+    // Payment date modal — intercepts the → Paid transition
+    const [showPaidDateModal, setShowPaidDateModal] = useState(false)
+    const [pendingPaidOrder, setPendingPaidOrder] = useState(null)
+    const [paidDateOverride, setPaidDateOverride] = useState('')
+    const [confirmingPaidDate, setConfirmingPaidDate] = useState(false)
 
     async function fetchOrderFinancials(order) {
         setLoadingFin(true)
@@ -218,7 +233,8 @@ export default function Orders() {
 
     // Accepts explicit order OR falls back to selected panel
     async function fulfillRestockedOrder(targetOrder = null) {
-        const order = targetOrder || selected
+        // Safe check: if targetOrder is a React event or does not have an ID, fall back to selected
+        const order = (targetOrder && targetOrder.id) ? targetOrder : selected
         if (!order) return
 
         setSaving(true)
@@ -301,7 +317,11 @@ export default function Orders() {
             // Advance order
             const { error: err2 } = await supabase
                 .from('orders')
-                .update({ status: 'ready' })
+                .update({
+                    status: 'ready',
+                    // Note: fulfillRestockedOrder moves to 'ready', not 'paid'
+                    // paid_at is set separately when the user marks it paid
+                })
                 .eq('id', order.id)
 
             if (err2) throw new Error(err2.message)
@@ -652,8 +672,32 @@ export default function Orders() {
             initDelivery(order)
         } else if (targetStatus === 'ready' && order.type === 'custom') {
             initProductionDetails(order)   // intercept for custom orders
+        } else if (targetStatus === 'paid') {
+            // Ask "when was this paid?" — pre-fill with the order's own creation date
+            const orderDay = order.created_at
+                ? order.created_at.split('T')[0]
+                : new Date().toISOString().split('T')[0]
+            setPaidDateOverride(orderDay)
+            setPendingPaidOrder(order)
+            setShowPaidDateModal(true)
         } else {
             applyStatusChange(order, targetStatus)
+        }
+    }
+
+    // Confirm payment date then finalise the → paid transition
+    async function confirmPaidDate() {
+        if (!pendingPaidOrder) return
+        setConfirmingPaidDate(true)
+        try {
+            const chosenDate = paidDateOverride
+                ? new Date(paidDateOverride).toISOString()
+                : new Date().toISOString()
+            await applyStatusChange(pendingPaidOrder, 'paid', { paidAt: chosenDate })
+            setShowPaidDateModal(false)
+            setPendingPaidOrder(null)
+        } finally {
+            setConfirmingPaidDate(false)
         }
     }
     // ─── SAVE ORDER ───────────────────────────────────────────────
@@ -664,6 +708,11 @@ export default function Orders() {
         try {
             const client = clients.find(c => c.id === form.client_id)
             const validItems = items.filter(i => i.product_id || i.custom_description.trim())
+
+            // If backdated, we inject created_at — everything else is identical
+            const backdatedCreatedAt = form.isBackdated && form.orderDate
+                ? new Date(form.orderDate).toISOString()
+                : undefined
 
             let initialStatus = form.status
             let finalPrice = parseFloat(form.total_price) || null
@@ -709,6 +758,7 @@ export default function Orders() {
                     reference_image_url: form.type === 'custom' ? (form.reference_image_url || null) : null,
                     stl_url: form.type === 'custom' ? (form.stl_url || null) : null,
                     is_paid: false,
+                    ...(backdatedCreatedAt ? { created_at: backdatedCreatedAt } : {}),
                 }])
                 .select().single()
 
@@ -816,6 +866,46 @@ export default function Orders() {
             .eq('order_id', orderId)
     }
 
+    // Auto-add custom product to catalogue when order is paid
+    async function createProductFromOrder(order) {
+        if (order.type !== 'custom' || !order.custom_description) return
+        try {
+            // Get production cost from linked production
+            const { data: prod } = await supabase
+                .from('productions')
+                .select('actual_cost, filament_grams, print_time_hours, material, color')
+                .eq('order_id', order.id)
+                .maybeSingle()
+
+            const clientName = order.clients?.name || ''
+            const paidDate = new Date().toLocaleDateString('en-GB', {
+                day: '2-digit', month: 'short', year: 'numeric'
+            })
+
+            await supabase.from('products').insert([{
+                name: order.custom_description,
+                category: 'Custom Orders',
+                description: [
+                    clientName ? `Made for ${clientName}` : null,
+                    paidDate,
+                    order.reference_notes || null,
+                ].filter(Boolean).join(' — '),
+                selling_price: parseFloat(order.total_price) || null,
+                production_cost: parseFloat(prod?.actual_cost) || null,
+                material: prod?.material || null,
+                color: prod?.color || null,
+                print_time_hours: prod?.print_time_hours || null,
+                filament_grams: prod?.filament_grams || null,
+                image_url: order.reference_image_url || null,
+                stl_url: order.stl_url || null,
+                is_active: true,
+            }])
+        } catch (err) {
+            // Non-blocking — don't fail the order if product creation fails
+            console.error('Failed to create product from order:', err)
+        }
+    }
+
     // ─── ADVANCE STATUS ───────────────────────────────────────────
     async function advanceStatus(order) {
         const next = getNextStatus(order)
@@ -823,7 +913,7 @@ export default function Orders() {
         await applyStatusChange(order, next)
     }
 
-    async function applyStatusChange(order, next) {
+    async function applyStatusChange(order, next, options = {}) {
         setSaving(true)
         setError('')
 
@@ -922,10 +1012,20 @@ export default function Orders() {
             // ── UPDATE ORDER STATUS ──────────────────────────────────
             const { error: updateErr } = await supabase
                 .from('orders')
-                .update({ status: next, is_paid: next === 'paid' })
+                .update({
+                    status: next,
+                    is_paid: next === 'paid',
+                    // Use caller-supplied paidAt if provided (backdated orders), else now
+                    ...(next === 'paid' ? { paid_at: options.paidAt ?? new Date().toISOString() } : {}),
+                })
                 .eq('id', order.id)
 
             if (updateErr) throw new Error(updateErr.message)
+
+            // Auto-create product when custom order is paid
+            if (next === 'paid' && order.type === 'custom') {
+                await createProductFromOrder(order)
+            }
 
             // ── SYNC PRODUCTION (custom orders only) ─────────────────
             if (order.type === 'custom') {
@@ -1349,70 +1449,75 @@ export default function Orders() {
                             {/* ── CUSTOM ORDER FIELDS ── */}
                             {form.type === 'custom' && (
                                 <div className="space-y-3">
+
+                                    {/* Product name — was "What do they want?" */}
                                     <div>
                                         <label className="text-sm font-medium text-slate-700 block mb-1.5">
-                                            What does the client want? *
+                                            Product Name *
                                         </label>
-                                        <textarea value={form.custom_description}
+                                        <input
+                                            value={form.custom_description}
                                             onChange={e => setForm(f => ({ ...f, custom_description: e.target.value }))}
-                                            placeholder="Describe the product in detail..."
-                                            rows={3}
-                                            className="w-full border-2 border-slate-200 focus:border-sky-400 rounded-xl px-3 py-2.5 text-sm outline-none resize-none transition-colors" />
-                                    </div>
-                                    <div className="grid grid-cols-2 gap-3">
-                                        <div>
-                                            <label className="text-sm font-medium text-slate-700 block mb-1.5">Dimensions</label>
-                                            <input value={form.dimensions}
-                                                onChange={e => setForm(f => ({ ...f, dimensions: e.target.value }))}
-                                                placeholder="e.g. 10×5×3 cm"
-                                                className="w-full border-2 border-slate-200 focus:border-sky-400 rounded-xl px-3 py-2.5 text-sm outline-none transition-colors" />
-                                        </div>
-                                        <div>
-                                            <label className="text-sm font-medium text-slate-700 block mb-1.5">
-                                                Price (TND)
-                                                <span className="text-slate-400 text-xs font-normal ml-1">optional</span>
-                                            </label>
-                                            <input type="number" value={form.total_price}
-                                                onChange={e => setForm(f => ({ ...f, total_price: e.target.value }))}
-                                                placeholder="TBD"
-                                                className="w-full border-2 border-slate-200 focus:border-sky-400 rounded-xl px-3 py-2.5 text-sm outline-none transition-colors" />
-                                        </div>
-                                    </div>
-                                    <div>
-                                        <label className="text-sm font-medium text-slate-700 block mb-1.5">Reference / Instructions</label>
-                                        <textarea value={form.reference_notes}
-                                            onChange={e => setForm(f => ({ ...f, reference_notes: e.target.value }))}
-                                            placeholder="Color, image reference, special requirements..."
-                                            rows={2}
-                                            className="w-full border-2 border-slate-200 focus:border-sky-400 rounded-xl px-3 py-2.5 text-sm outline-none resize-none transition-colors" />
+                                            placeholder="e.g. Dragon Keychain, Custom Trophy, Phone Stand..."
+                                            className="w-full border-2 border-slate-200 focus:border-sky-400 rounded-xl px-3 py-2.5 text-sm font-medium focus:outline-none transition-colors" />
+                                        <p className="text-xs text-slate-400 mt-1">
+                                            Name of the product you will make — saved to catalogue when order is paid
+                                        </p>
                                     </div>
 
-                                    {/* Reference image from client */}
+                                    {/* Dimensions */}
+                                    <div>
+                                        <label className="text-sm font-medium text-slate-700 block mb-1.5">Dimensions</label>
+                                        <input
+                                            value={form.dimensions}
+                                            onChange={e => setForm(f => ({ ...f, dimensions: e.target.value }))}
+                                            placeholder="e.g. 10×5×3 cm"
+                                            className="w-full border border-slate-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-sky-300" />
+                                    </div>
+
+                                    {/* Price */}
+                                    <div>
+                                        <label className="text-sm font-medium text-slate-700 block mb-1.5">
+                                            Price (TND)
+                                            <span className="text-slate-400 font-normal ml-1">— leave empty if not agreed yet</span>
+                                        </label>
+                                        <input
+                                            type="number"
+                                            value={form.total_price}
+                                            onChange={e => setForm(f => ({ ...f, total_price: e.target.value }))}
+                                            placeholder="TBD"
+                                            className="w-full border border-slate-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-sky-300" />
+                                    </div>
+
+                                    {/* Reference / Instructions — now holds the description */}
+                                    <div>
+                                        <label className="text-sm font-medium text-slate-700 block mb-1.5">
+                                            Reference / Instructions
+                                        </label>
+                                        <textarea
+                                            value={form.reference_notes}
+                                            onChange={e => setForm(f => ({ ...f, reference_notes: e.target.value }))}
+                                            placeholder="What the client wants, color preferences, special requirements, reference links..."
+                                            rows={3}
+                                            className="w-full border border-slate-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-sky-300 resize-none" />
+                                    </div>
+
+                                    {/* Reference image and STL */}
                                     <ImageUpload
                                         folder="orders/images"
-                                        value={form.reference_image_url || ''}
+                                        value={form.reference_image_url}
                                         onChange={url => setForm(f => ({ ...f, reference_image_url: url }))}
-                                        label={
-                                            <span>
-                                                Reference Image
-                                                <span className="text-slate-400 font-normal ml-1">— photo sent by the client</span>
-                                            </span>
-                                        } />
+                                        label="Reference Image — photo from client" />
 
-                                    {/* STL file if you already have the design */}
                                     <StlUpload
                                         folder="orders/stl"
-                                        value={form.stl_url || ''}
+                                        value={form.stl_url}
                                         onChange={url => setForm(f => ({ ...f, stl_url: url }))}
-                                        label={
-                                            <span>
-                                                STL File
-                                                <span className="text-slate-400 font-normal ml-1">— optional, add when ready</span>
-                                            </span>
-                                        } />
+                                        label="STL File — optional, add when design is ready" />
+
                                     <div className="bg-violet-50 border border-violet-200 rounded-xl p-3">
                                         <p className="text-xs text-violet-700 font-medium">
-                                            🖨️ A print job will be automatically queued for this order
+                                            🖨️ A print job will be queued automatically · 📦 Product added to catalogue when paid
                                         </p>
                                     </div>
                                 </div>
@@ -1426,21 +1531,30 @@ export default function Orders() {
                                         {items.map((item, idx) => (
                                             <div key={idx} className="bg-slate-50 border border-slate-200 rounded-xl p-3 space-y-2">
                                                 <div className="flex gap-2 items-start">
-                                                    <div className="flex-1 space-y-1">
-                                                        <select value={item.product_id}
+                                                    <div className="flex-1">
+                                                        {/* Catalogue products only — no custom option */}
+                                                        <select
+                                                            value={item.product_id}
                                                             onChange={e => updateItem(idx, 'product_id', e.target.value)}
-                                                            className="w-full border border-slate-200 rounded-lg px-2 py-2 text-sm bg-white outline-none focus:ring-2 focus:ring-sky-300">
-                                                            <option value="">— Custom (not in catalogue) —</option>
-                                                            {products.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
+                                                            className="w-full border border-slate-200 rounded-lg px-2 py-2 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-sky-300">
+                                                            <option value="">— Select from catalogue —</option>
+                                                            {products.map(p => (
+                                                                <option key={p.id} value={p.id}>{p.name}</option>
+                                                            ))}
                                                         </select>
-                                                        <button onClick={() => setShowNewProduct(showNewProduct === idx ? null : idx)}
-                                                            className="text-xs text-sky-500 hover:text-sky-700 flex items-center gap-1 pl-1">
+
+                                                        {/* Add new product to catalogue inline */}
+                                                        <button
+                                                            onClick={() => setShowNewProduct(showNewProduct === idx ? null : idx)}
+                                                            className="mt-1 text-xs text-sky-500 hover:text-sky-700 flex items-center gap-1">
                                                             <PackagePlus size={11} />
-                                                            Add new product to catalogue
+                                                            Product not in catalogue? Add it
                                                         </button>
                                                     </div>
+
                                                     {items.length > 1 && (
-                                                        <button onClick={() => setItems(p => p.filter((_, i) => i !== idx))}
+                                                        <button
+                                                            onClick={() => setItems(p => p.filter((_, i) => i !== idx))}
                                                             className="p-2 text-red-400 hover:bg-red-50 rounded-lg mt-0.5 flex-shrink-0">
                                                             <X size={14} />
                                                         </button>
@@ -1450,28 +1564,34 @@ export default function Orders() {
                                                 {/* Inline new product form */}
                                                 {showNewProduct === idx && (
                                                     <div className="bg-white border-2 border-sky-200 rounded-xl p-3 space-y-2">
-                                                        <p className="text-xs font-bold text-sky-700">Quick Add Product</p>
-                                                        <input value={newProduct.name}
+                                                        <p className="text-xs font-bold text-sky-700">Add to Catalogue</p>
+                                                        <input
+                                                            value={newProduct.name}
                                                             onChange={e => setNewProduct(f => ({ ...f, name: e.target.value }))}
                                                             placeholder="Product name *"
-                                                            className="w-full border border-slate-200 rounded-lg px-2.5 py-2 text-sm outline-none focus:ring-2 focus:ring-sky-300" />
+                                                            className="w-full border border-slate-200 rounded-lg px-2.5 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-sky-300" />
                                                         <div className="grid grid-cols-2 gap-2">
-                                                            <select value={newProduct.category}
+                                                            <select
+                                                                value={newProduct.category}
                                                                 onChange={e => setNewProduct(f => ({ ...f, category: e.target.value }))}
-                                                                className="border border-slate-200 rounded-lg px-2 py-2 text-sm bg-white outline-none">
+                                                                className="border border-slate-200 rounded-lg px-2 py-2 text-sm bg-white focus:outline-none">
                                                                 {CATEGORIES.map(c => <option key={c}>{c}</option>)}
                                                             </select>
-                                                            <input type="number" value={newProduct.selling_price}
+                                                            <input
+                                                                type="number"
+                                                                value={newProduct.selling_price}
                                                                 onChange={e => setNewProduct(f => ({ ...f, selling_price: e.target.value }))}
                                                                 placeholder="Price (TND)"
-                                                                className="border border-slate-200 rounded-lg px-2 py-2 text-sm outline-none" />
+                                                                className="border border-slate-200 rounded-lg px-2 py-2 text-sm focus:outline-none" />
                                                         </div>
                                                         <div className="flex gap-2">
-                                                            <button onClick={() => setShowNewProduct(null)}
+                                                            <button
+                                                                onClick={() => setShowNewProduct(null)}
                                                                 className="flex-1 py-1.5 text-xs border border-slate-200 rounded-lg hover:bg-slate-50">
                                                                 Cancel
                                                             </button>
-                                                            <button onClick={() => createProductInline(idx)}
+                                                            <button
+                                                                onClick={() => createProductInline(idx)}
                                                                 disabled={savingInline || !newProduct.name.trim()}
                                                                 className="flex-1 py-1.5 text-xs bg-sky-500 text-white rounded-lg hover:bg-sky-600 disabled:opacity-50 font-medium">
                                                                 {savingInline ? '...' : '+ Add & Select'}
@@ -1480,38 +1600,34 @@ export default function Orders() {
                                                     </div>
                                                 )}
 
-                                                {!item.product_id && showNewProduct !== idx && (
-                                                    <input value={item.custom_description}
-                                                        onChange={e => updateItem(idx, 'custom_description', e.target.value)}
-                                                        placeholder="Describe the item..."
-                                                        className="w-full border border-slate-200 rounded-lg px-2.5 py-2 text-sm outline-none focus:ring-2 focus:ring-sky-300" />
-                                                )}
-
                                                 <div className="grid grid-cols-2 gap-2">
                                                     <div>
                                                         <label className="text-xs text-slate-400 block mb-0.5">Quantity</label>
-                                                        <input type="number" min="1" value={item.quantity}
+                                                        <input
+                                                            type="number" min="1" value={item.quantity}
                                                             onChange={e => updateItem(idx, 'quantity', e.target.value)}
-                                                            className="w-full border border-slate-200 rounded-lg px-2.5 py-2 text-sm outline-none focus:ring-2 focus:ring-sky-300" />
+                                                            className="w-full border border-slate-200 rounded-lg px-2.5 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-sky-300" />
                                                     </div>
                                                     <div>
                                                         <label className="text-xs text-slate-400 block mb-0.5">Price (TND)</label>
-                                                        <input type="number" value={item.unit_price}
+                                                        <input
+                                                            type="number" value={item.unit_price}
                                                             onChange={e => updateItem(idx, 'unit_price', e.target.value)}
                                                             placeholder="0.00"
-                                                            className="w-full border border-slate-200 rounded-lg px-2.5 py-2 text-sm outline-none focus:ring-2 focus:ring-sky-300" />
+                                                            className="w-full border border-slate-200 rounded-lg px-2.5 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-sky-300" />
                                                     </div>
                                                 </div>
                                             </div>
                                         ))}
                                     </div>
 
-                                    <button onClick={() => setItems(p => [...p, { ...emptyItem }])}
+                                    <button
+                                        onClick={() => setItems(p => [...p, { ...emptyItem }])}
                                         className="mt-2 w-full py-2.5 border-2 border-dashed border-slate-200 rounded-xl text-sm text-slate-400 hover:border-sky-300 hover:text-sky-500 transition-colors">
                                         + Add item
                                     </button>
 
-                                    {items.some(i => i.unit_price) && (
+                                    {items.some(i => i.unit_price && i.product_id) && (
                                         <div className="mt-2 bg-emerald-50 border border-emerald-200 rounded-xl px-3 py-2 text-sm font-bold text-emerald-700">
                                             Total: {calcTotal(items).toFixed(2)} TND
                                         </div>
@@ -1519,7 +1635,7 @@ export default function Orders() {
 
                                     <div className="bg-teal-50 border border-teal-200 rounded-xl p-3 mt-2">
                                         <p className="text-xs text-teal-700 font-medium">
-                                            📦 Stock will be checked automatically. If unavailable, order will be placed on hold.
+                                            📦 Stock will be checked automatically on creation.
                                         </p>
                                     </div>
                                 </div>
@@ -1543,6 +1659,49 @@ export default function Orders() {
                                     className="w-full border-2 border-slate-200 focus:border-sky-400 rounded-xl px-3 py-2.5 text-sm outline-none resize-none transition-colors" />
                             </div>
 
+                            {/* ── BACKDATED ENTRY SECTION ── */}
+                            <div className="border-2 border-dashed border-amber-300 rounded-xl overflow-hidden">
+                                {/* Toggle header */}
+                                <button
+                                    type="button"
+                                    onClick={() => setForm(f => ({
+                                        ...f,
+                                        isBackdated: !f.isBackdated,
+                                        orderDate: f.isBackdated ? '' : f.orderDate,
+                                    }))}
+                                    className={`w-full flex items-center justify-between px-4 py-3 text-sm font-semibold transition-colors
+                                        ${form.isBackdated ? 'bg-amber-50 text-amber-800' : 'bg-white text-slate-500 hover:bg-amber-50 hover:text-amber-700'}`}
+                                >
+                                    <span className="flex items-center gap-2">
+                                        <span>🕐</span>
+                                        <span>Backdated Entry — order happened in the past</span>
+                                    </span>
+                                    <span className={`w-9 h-5 rounded-full transition-colors flex items-center px-0.5
+                                        ${form.isBackdated ? 'bg-amber-400' : 'bg-slate-200'}`}>
+                                        <span className={`w-4 h-4 bg-white rounded-full shadow transition-transform
+                                            ${form.isBackdated ? 'translate-x-4' : 'translate-x-0'}`} />
+                                    </span>
+                                </button>
+
+                                {/* Expanded — just the date picker */}
+                                {form.isBackdated && (
+                                    <div className="px-4 pb-4 pt-2 bg-amber-50 space-y-3">
+                                        <p className="text-xs text-amber-700 leading-relaxed">
+                                            🕐 Sets the order date to a past date. Stock checks, production jobs, and the full status workflow all run <strong>exactly as normal</strong> — only <code className="bg-amber-100 px-1 rounded">created_at</code> is backdated so your financial charts show it in the right week/month.
+                                        </p>
+                                        <div>
+                                            <label className="text-xs font-semibold text-amber-800 block mb-1">Order Date *</label>
+                                            <input
+                                                type="date"
+                                                value={form.orderDate}
+                                                max={new Date().toISOString().split('T')[0]}
+                                                onChange={e => setForm(f => ({ ...f, orderDate: e.target.value }))}
+                                                className="w-full border border-amber-300 bg-white rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-amber-300" />
+                                        </div>
+                                    </div>
+                                )}
+                            </div>
+
                             {/* Form error */}
                             {error && (
                                 <div className="bg-red-50 border border-red-200 rounded-xl p-3 text-sm text-red-600 font-medium">
@@ -1558,9 +1717,10 @@ export default function Orders() {
                                 Cancel
                             </button>
                             <button onClick={saveOrder}
-                                disabled={saving || !form.client_id || (form.type === 'custom' && !form.custom_description.trim())}
-                                className="flex-1 py-3 bg-sky-500 hover:bg-sky-600 disabled:opacity-50 text-white rounded-xl text-sm font-semibold transition-colors">
-                                {saving ? 'Creating...' : 'Create Order'}
+                                disabled={saving || !form.client_id || (form.type === 'custom' && !form.custom_description.trim()) || (form.isBackdated && !form.orderDate)}
+                                className={`flex-1 py-3 disabled:opacity-50 text-white rounded-xl text-sm font-semibold transition-colors
+                                    ${form.isBackdated ? 'bg-amber-500 hover:bg-amber-600' : 'bg-sky-500 hover:bg-sky-600'}`}>
+                                {saving ? 'Creating...' : form.isBackdated ? '🕐 Create Backdated Order' : 'Create Order'}
                             </button>
                         </div>
                     </div>
@@ -2475,6 +2635,52 @@ export default function Orders() {
                                 disabled={confirmingPkg}
                                 className="w-full py-2.5 border border-slate-200 text-slate-500 hover:bg-slate-50 rounded-xl text-sm font-medium transition-colors">
                                 Cancel
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
+            {/* ══════════════════════════════════════════════════════
+          PAYMENT DATE MODAL
+      ══════════════════════════════════════════════════════ */}
+            {showPaidDateModal && (
+                <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
+                    <div className="bg-white w-full max-w-sm rounded-2xl shadow-2xl overflow-hidden">
+                        <div className="p-5 border-b border-slate-100 flex items-center justify-between">
+                            <h2 className="font-bold text-slate-800">Confirm Payment Date</h2>
+                            <button onClick={() => { setShowPaidDateModal(false); setPendingPaidOrder(null) }} className="p-1 hover:bg-slate-100 rounded-lg">
+                                <X size={18} />
+                            </button>
+                        </div>
+                        <div className="p-5 space-y-4">
+                            <p className="text-sm text-slate-600">
+                                When was the payment received for this order? This affects your financial dashboard charts.
+                            </p>
+                            <div>
+                                <label className="text-xs font-semibold text-slate-700 block mb-1.5">Payment Date *</label>
+                                <input
+                                    type="date"
+                                    value={paidDateOverride}
+                                    max={new Date().toISOString().split('T')[0]}
+                                    onChange={e => setPaidDateOverride(e.target.value)}
+                                    className="w-full border-2 border-slate-200 focus:border-sky-400 rounded-xl px-3 py-2.5 text-sm outline-none transition-colors"
+                                />
+                            </div>
+                        </div>
+                        <div className="p-5 pt-0 flex gap-2">
+                            <button
+                                onClick={() => { setShowPaidDateModal(false); setPendingPaidOrder(null) }}
+                                disabled={confirmingPaidDate}
+                                className="flex-1 py-2.5 border border-slate-200 rounded-xl text-sm font-medium hover:bg-slate-50 text-slate-600"
+                            >
+                                Cancel
+                            </button>
+                            <button
+                                onClick={confirmPaidDate}
+                                disabled={confirmingPaidDate || !paidDateOverride}
+                                className="flex-[2] py-2.5 bg-emerald-500 hover:bg-emerald-600 disabled:opacity-50 text-white rounded-xl text-sm font-bold transition-colors"
+                            >
+                                {confirmingPaidDate ? 'Saving...' : '💰 Mark as Paid'}
                             </button>
                         </div>
                     </div>

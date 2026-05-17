@@ -75,8 +75,10 @@ export default function Dashboard() {
     const navigate = useNavigate()
 
     const now = new Date()
-    const thisMonth = now.toISOString().slice(0, 7)
-    const lastMonth = new Date(now.getFullYear(), now.getMonth() - 1, 1).toISOString().slice(0, 7)
+    // Use local-timezone month keys (toISOString() is UTC and shifts months for UTC+ timezones)
+    const toMonthKey = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`
+    const thisMonth = toMonthKey(now)
+    const lastMonth = toMonthKey(new Date(now.getFullYear(), now.getMonth() - 1, 1))
 
     useEffect(() => { fetchAll() }, [])
 
@@ -94,7 +96,7 @@ export default function Dashboard() {
             { data: settledConsignments },
             { data: resellerSales },
         ] = await Promise.all([
-            supabase.from('orders').select('id,status,total_price,is_paid,created_at,deadline,type,clients(name)'),
+            supabase.from('orders').select('id,status,total_price,is_paid,created_at,paid_at,deadline,type,clients(name)'),
             supabase.from('expenses').select('amount,date,category'),
             supabase.from('clients').select('id'),
             supabase.from('products').select('id,is_active'),
@@ -136,9 +138,14 @@ export default function Dashboard() {
         const pendingResellerRev = (activeConsignments || [])
             .reduce((sum, c) => sum + consignmentTotal(c.id), 0)
 
-        // ── Financials (Step 3c) ──────────────────────────────────────
-        const directRevThis = allOrders.filter(o => o.is_paid && o.created_at?.startsWith(thisMonth)).reduce((s, o) => s + (o.total_price || 0), 0)
-        const directRevLast = allOrders.filter(o => o.is_paid && o.created_at?.startsWith(lastMonth)).reduce((s, o) => s + (o.total_price || 0), 0)
+        // Use paid_at for revenue — exact moment money was received
+        const paidThisMonth = allOrders.filter(o =>
+            o.is_paid && (o.paid_at || o.created_at)?.startsWith(thisMonth))
+        const paidLastMonth = allOrders.filter(o =>
+            o.is_paid && (o.paid_at || o.created_at)?.startsWith(lastMonth))
+
+        const directRevThis = paidThisMonth.reduce((s, o) => s + (o.total_price || 0), 0)
+        const directRevLast = paidLastMonth.reduce((s, o) => s + (o.total_price || 0), 0)
         const resellerRevThis = resellerRevByMonth[thisMonth] || 0
         const resellerRevLast = resellerRevByMonth[lastMonth] || 0
 
@@ -154,21 +161,22 @@ export default function Dashboard() {
         for (let i = 5; i >= 0; i--) {
             const d = new Date(now.getFullYear(), now.getMonth() - i, 1)
             months.push({
-                key: d.toISOString().slice(0, 7),
+                key: toMonthKey(d),   // local-timezone safe (no UTC shift)
                 label: d.toLocaleDateString('en-GB', { month: 'short' })
             })
         }
 
+        // Monthly financials also use paid_at
         const monthlyFinancials = months.map(m => {
-            const directSales = allOrders
-                .filter(o => o.status !== 'cancelled' && o.created_at?.startsWith(m.key))
+            const directRev = allOrders
+                .filter(o => o.is_paid && (o.paid_at || o.created_at)?.startsWith(m.key))
                 .reduce((s, o) => s + (o.total_price || 0), 0)
             const resellerRev = resellerRevByMonth[m.key] || 0
-            const totalRev = directSales + resellerRev
+            const totalRev = directRev + resellerRev
             const exp = allExp.filter(e => e.date?.startsWith(m.key)).reduce((s, e) => s + (e.amount || 0), 0)
             return {
                 month: m.label,
-                'Direct Sales': parseFloat(directSales.toFixed(2)),
+                'Direct Sales': parseFloat(directRev.toFixed(2)),
                 'Reseller': parseFloat(resellerRev.toFixed(2)),
                 Revenue: parseFloat(totalRev.toFixed(2)),
                 Expenses: parseFloat(exp.toFixed(2)),
