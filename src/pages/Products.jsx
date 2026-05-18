@@ -171,8 +171,8 @@ export default function Products() {
             {/* Header */}
             <div className="flex items-center justify-between mb-6">
                 <div>
-                    <h1 className="text-2xl font-bold text-slate-800">Products</h1>
-                    <p className="text-sm text-slate-500">{products.length} products in catalogue</p>
+                    <h1 className="text-2xl font-bold text-slate-800">Catalogue</h1>
+                    <p className="text-sm text-slate-500">{products.length} products</p>
                 </div>
                 <button onClick={openAdd}
                     className="flex items-center gap-2 bg-sky-500 hover:bg-sky-600 text-white px-4 py-2.5 rounded-xl font-medium transition-colors">

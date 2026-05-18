@@ -139,25 +139,7 @@ export default function Stock() {
         <p>⚙️ <strong>Use "Manual Adjustment"</strong> only for corrections, damaged, gifted, lost items</p>
       </div>
 
-      {/* Stats */}
-      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-6">
-        <div className="bg-white rounded-2xl border border-slate-100 shadow-sm p-4 text-center">
-          <p className="text-2xl font-bold text-emerald-600">{totalAvailable}</p>
-          <p className="text-xs text-slate-400 mt-0.5">📦 Available</p>
-        </div>
-        <div className="bg-white rounded-2xl border border-slate-100 shadow-sm p-4 text-center">
-          <p className="text-2xl font-bold text-purple-600">{totalReseller}</p>
-          <p className="text-xs text-slate-400 mt-0.5">🤝 With Reseller</p>
-        </div>
-        <div className="bg-white rounded-2xl border border-slate-100 shadow-sm p-4 text-center">
-          <p className="text-2xl font-bold text-amber-500">{lowStock.length}</p>
-          <p className="text-xs text-slate-400 mt-0.5">⚠️ Low Stock</p>
-        </div>
-        <div className="bg-white rounded-2xl border border-slate-100 shadow-sm p-4 text-center">
-          <p className="text-2xl font-bold text-red-500">{outOfStock.length}</p>
-          <p className="text-xs text-slate-400 mt-0.5">🚫 Out of Stock</p>
-        </div>
-      </div>
+
 
       {/* Alerts */}
       {lowStock.length > 0 && (

@@ -15,7 +15,7 @@ const nav = [
     { to: '/productions', icon: Printer, label: 'Production' },
     { to: '/stock', icon: Package, label: 'Stock' },
     { to: '/materials', icon: Wrench, label: 'Materials' },
-    { to: '/products', icon: Box, label: 'Products' },
+    { to: '/products', icon: Box, label: 'Catalogue' },
     { to: '/clients', icon: Users, label: 'Clients' },
     { to: '/reseller', icon: Handshake, label: 'Reseller' },
     { to: '/expenses', icon: Receipt, label: 'Expenses' },

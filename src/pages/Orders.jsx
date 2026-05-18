@@ -646,6 +646,7 @@ export default function Orders() {
                         type: 'used',
                         quantity: qty,
                         is_positive: false,
+                        order_id: pendingDelivery.id,
                         notes: `Packaging — ${pendingDelivery.clients?.name || 'order'}`,
                     }])
                 }
