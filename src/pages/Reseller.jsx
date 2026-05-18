@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react'
 import { supabase } from '../lib/supabase'
 import { Plus, X, Trash2, CheckCircle, ChevronDown, ChevronUp } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
+import { useAuth } from '../lib/AuthContext'
 
 const emptyConsignment = {
     reseller_id: '', product_id: '', quantity_given: '',
@@ -15,6 +16,7 @@ const emptySaleForm = {
 
 export default function Reseller() {
     const navigate = useNavigate()
+    const { isAdmin, isReseller, profile } = useAuth()
 
     const [resellers, setResellers] = useState([])
     const [consignments, setConsignments] = useState([])
@@ -31,7 +33,11 @@ export default function Reseller() {
     const [activeReseller, setActive] = useState(null)
     const [expandedHistory, setExpandedHist] = useState(null)
 
-    useEffect(() => { fetchAll() }, [])
+    const visibleResellers = isReseller
+        ? resellers.filter(r => r.id === profile?.reseller_client_id)
+        : resellers
+
+    useEffect(() => { fetchAll() }, [profile])
 
     async function fetchAll() {
         setLoading(true)
@@ -49,7 +55,12 @@ export default function Reseller() {
         setConsignments(cs || [])
         setSales(sl || [])
         setProducts(pr || [])
-        if (rs?.length > 0 && !activeReseller) setActive(rs[0].id)
+        if (rs?.length > 0 && !activeReseller) {
+            const defaultActive = isReseller
+                ? (rs.find(r => r.id === profile?.reseller_client_id)?.id || rs[0].id)
+                : rs[0].id
+            setActive(defaultActive)
+        }
         setLoading(false)
     }
 
@@ -230,19 +241,21 @@ export default function Reseller() {
 
     if (loading) return <div className="text-center py-20 text-slate-400">Loading...</div>
 
-    if (resellers.length === 0) return (
+    if (visibleResellers.length === 0) return (
         <div className="max-w-2xl mx-auto">
             <h1 className="text-2xl font-bold text-slate-800 mb-6">Resellers</h1>
             <div className="text-center py-20 bg-white rounded-2xl border border-slate-100">
                 <p className="text-4xl mb-3">🤝</p>
                 <p className="text-slate-600 font-semibold mb-1">No resellers yet</p>
                 <p className="text-slate-400 text-sm mb-6">
-                    Go to <strong>Clients</strong>, add a client and enable the <strong>Reseller</strong> toggle.
+                    {isAdmin ? 'Go to Clients, add a client and enable the Reseller toggle.' : 'Contact administrator to link your reseller account.'}
                 </p>
-                <button onClick={() => navigate('/clients')}
-                    className="inline-flex items-center gap-2 bg-sky-500 hover:bg-sky-600 text-white px-5 py-2.5 rounded-xl font-medium text-sm transition-colors">
-                    Go to Clients →
-                </button>
+                {isAdmin && (
+                    <button onClick={() => navigate('/clients')}
+                        className="inline-flex items-center gap-2 bg-sky-500 hover:bg-sky-600 text-white px-5 py-2.5 rounded-xl font-medium text-sm transition-colors">
+                        Go to Clients →
+                    </button>
+                )}
             </div>
         </div>
     )
@@ -254,18 +267,20 @@ export default function Reseller() {
             <div className="flex items-center justify-between mb-6">
                 <div>
                     <h1 className="text-2xl font-bold text-slate-800">Resellers</h1>
-                    <p className="text-sm text-slate-500">{resellers.length} reseller{resellers.length > 1 ? 's' : ''}</p>
+                    <p className="text-sm text-slate-500">{visibleResellers.length} reseller{visibleResellers.length > 1 ? 's' : ''}</p>
                 </div>
-                <button onClick={() => setShowModal(true)}
-                    className="flex items-center gap-2 bg-sky-500 hover:bg-sky-600 text-white px-4 py-2.5 rounded-xl font-medium transition-colors">
-                    <Plus size={18} /> Give Products
-                </button>
+                {isAdmin && (
+                    <button onClick={() => setShowModal(true)}
+                        className="flex items-center gap-2 bg-sky-500 hover:bg-sky-600 text-white px-4 py-2.5 rounded-xl font-medium transition-colors">
+                        <Plus size={18} /> Give Products
+                    </button>
+                )}
             </div>
 
             {/* Reseller tabs */}
-            {resellers.length > 1 && (
+            {visibleResellers.length > 1 && (
                 <div className="flex gap-2 mb-5 overflow-x-auto" style={{ scrollbarWidth: 'none' }}>
-                    {resellers.map(r => (
+                    {visibleResellers.map(r => (
                         <button key={r.id} onClick={() => setActive(r.id)}
                             className={`px-4 py-2 rounded-xl text-sm font-medium flex-shrink-0 transition-colors
                 ${activeReseller === r.id ? 'bg-sky-500 text-white' : 'bg-white border border-slate-200 text-slate-600 hover:bg-slate-50'}`}>
@@ -275,7 +290,7 @@ export default function Reseller() {
                 </div>
             )}
 
-            {resellers.filter(r => !activeReseller || r.id === activeReseller).map(reseller => {
+            {visibleResellers.filter(r => !activeReseller || r.id === activeReseller).map(reseller => {
                 const active = consignments.filter(c => c.reseller_id === reseller.id && !c.is_settled)
                 const settled = consignments.filter(c => c.reseller_id === reseller.id && c.is_settled)
                 const owes = resellerBalance(reseller.id)
@@ -430,19 +445,21 @@ export default function Reseller() {
 
                                                 {/* Actions */}
                                                 {remaining > 0 && (
-                                                    <div className="grid grid-cols-2 gap-2 mb-2">
+                                                    <div className={isAdmin ? "grid grid-cols-2 gap-2 mb-2" : "mb-2"}>
                                                         <button onClick={() => openSaleModal(c)}
-                                                            className="py-2.5 text-xs font-semibold bg-emerald-50 hover:bg-emerald-100 text-emerald-700 rounded-xl border border-emerald-200 transition-colors">
+                                                            className={`py-2.5 text-xs font-semibold bg-emerald-50 hover:bg-emerald-100 text-emerald-700 rounded-xl border border-emerald-200 transition-colors ${!isAdmin ? 'w-full' : ''}`}>
                                                             💰 Report Sale
                                                         </button>
-                                                        <button onClick={() => reportReturn(c)}
-                                                            className="py-2.5 text-xs font-semibold bg-orange-50 hover:bg-orange-100 text-orange-600 rounded-xl border border-orange-200 transition-colors">
-                                                            ↩️ Return All ({remaining})
-                                                        </button>
+                                                        {isAdmin && (
+                                                            <button onClick={() => reportReturn(c)}
+                                                                className="py-2.5 text-xs font-semibold bg-orange-50 hover:bg-orange-100 text-orange-600 rounded-xl border border-orange-200 transition-colors">
+                                                                ↩️ Return All ({remaining})
+                                                            </button>
+                                                        )}
                                                     </div>
                                                 )}
 
-                                                {remaining === 0 && (
+                                                {isAdmin && remaining === 0 && (
                                                     <button onClick={() => settle(c.id)}
                                                         className="w-full py-2.5 text-sm font-semibold bg-emerald-500 hover:bg-emerald-600 text-white rounded-xl transition-colors flex items-center justify-center gap-2">
                                                         <CheckCircle size={16} /> Mark as Settled
@@ -517,7 +534,7 @@ export default function Reseller() {
                                     onChange={e => setForm(f => ({ ...f, reseller_id: e.target.value }))}
                                     className="w-full border border-slate-200 rounded-xl px-3 py-2.5 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-sky-300">
                                     <option value="">Select reseller...</option>
-                                    {resellers.map(r => <option key={r.id} value={r.id}>{r.name}</option>)}
+                                    {visibleResellers.map(r => <option key={r.id} value={r.id}>{r.name}</option>)}
                                 </select>
                             </div>
 
