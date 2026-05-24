@@ -3,16 +3,16 @@ import { supabase } from '../lib/supabase'
 import { Plus, X, Trash2, Shield, User } from 'lucide-react'
 import { createClient } from '@supabase/supabase-js'
 
-const supabaseAdmin = createClient(
-  import.meta.env.VITE_SUPABASE_URL,
-  import.meta.env.VITE_SUPABASE_SECRET_ROLE_KEY || import.meta.env.VITE_SUPABASE_SERVICE_ROLE_KEY,
-  {
-    auth: {
-      persistSession: false,
-      autoRefreshToken: false,
-    }
-  }
-)
+const adminKey = import.meta.env.VITE_SUPABASE_SECRET_ROLE_KEY || import.meta.env.VITE_SUPABASE_SERVICE_ROLE_KEY
+const supabaseAdmin = (import.meta.env.VITE_SUPABASE_URL && adminKey)
+  ? createClient(import.meta.env.VITE_SUPABASE_URL, adminKey, {
+      auth: {
+        persistSession: false,
+        autoRefreshToken: false,
+      }
+    })
+  : null
+
 
 export default function UserManagement() {
   const [profiles, setProfiles]   = useState([])
@@ -44,6 +44,10 @@ export default function UserManagement() {
     if (!form.email || !form.password || !form.full_name) return
     if (form.role === 'reseller' && !form.reseller_client_id) {
       setError('Select the reseller client account for this user.')
+      return
+    }
+    if (!supabaseAdmin) {
+      setError('Supabase Admin Key (service_role) is missing in environment variables. User creation is disabled.')
       return
     }
     setSaving(true)
@@ -80,6 +84,10 @@ export default function UserManagement() {
 
   async function deleteUser(userId) {
     if (!confirm('Delete this user? They will lose access immediately.')) return
+    if (!supabaseAdmin) {
+      alert('Supabase Admin Key (service_role) is missing in environment variables. User deletion is disabled.')
+      return
+    }
     try {
       await supabaseAdmin.auth.admin.deleteUser(userId)
       await supabase.from('profiles').delete().eq('id', userId)
