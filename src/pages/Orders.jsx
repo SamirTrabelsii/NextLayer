@@ -6,6 +6,10 @@ import {
 } from 'lucide-react'
 import ImageUpload from '../components/ImageUpload'
 import StlUpload from '../components/StlUpload'
+import Import3mfModal from '../components/Import3mfModal'
+import { calcFilamentCosts } from '../lib/parse3mf'
+import { useSettings } from '../lib/SettingsContext'
+import { deductFilamentFromSpools } from '../lib/filamentUtils'
 
 // ─── CONSTANTS ────────────────────────────────────────────────
 const STATUSES = [
@@ -102,7 +106,9 @@ export default function Orders() {
 
     const [showProductionModal, setShowProductionModal] = useState(false)
     const [pendingReady, setPendingReady] = useState(null)
-    const [productionForm, setProductionForm] = useState({ price: '', filament_grams: '', print_time_hours: '', actual_cost: '' })
+    const [productionForm, setProductionForm] = useState({
+        price: '', filament_grams: '', print_time_hours: '', actual_cost: '', filament_data: null
+    })
     const [productionFormError, setProductionFormError] = useState('')
     const [savingProduction, setSavingProduction] = useState(false)
 
@@ -111,6 +117,9 @@ export default function Orders() {
     const [pendingPaidOrder, setPendingPaidOrder] = useState(null)
     const [paidDateOverride, setPaidDateOverride] = useState('')
     const [confirmingPaidDate, setConfirmingPaidDate] = useState(false)
+
+    const [showOrderImport3mf, setShowOrderImport3mf] = useState(false)
+    const { settings } = useSettings()
 
     async function fetchOrderFinancials(order) {
         setLoadingFin(true)
@@ -593,7 +602,17 @@ export default function Orders() {
                     print_time_hours: hours,
                     actual_cost: actualCost,
                     status: 'done',
+                    filament_data: productionForm.filament_data ?? null,
                 }).eq('id', prod.id)
+
+                // ← ADD THIS: Deduct filament from spools
+                const { data: updatedProd } = await supabase
+                    .from('productions')
+                    .select('*')
+                    .eq('id', prod.id)
+                    .single()
+
+                await deductFilamentFromSpools(updatedProd)
             }
 
             // 3. Update selected panel state if it's open
@@ -620,6 +639,29 @@ export default function Orders() {
         } finally {
             setSavingProduction(false)
         }
+    }
+
+    function handleOrderImport3mf(data) {
+        const { filament_grams, support_grams, print_time_hours, filament_data, _filament_cost } = data
+
+        // Calculate full cost: filament (from spool/rate) + electricity + machine wear
+        const hours = parseFloat(print_time_hours) || 0
+        const elecCost = hours * (settings.electricity_per_hour || 0.15)
+        const machineRate = settings.machine_cost > 0 && settings.machine_lifespan_hours > 0
+            ? settings.machine_cost / settings.machine_lifespan_hours : 0
+        const nozzleRate = settings.nozzle_cost > 0 && settings.nozzle_lifespan_hours > 0
+            ? settings.nozzle_cost / settings.nozzle_lifespan_hours : 0
+        const wearCost = hours * (machineRate + nozzleRate)
+        const totalCost = parseFloat(((_filament_cost || 0) + elecCost + wearCost).toFixed(3))
+
+        setProductionForm(prev => ({
+            ...prev,
+            filament_grams: filament_grams ? String(filament_grams) : prev.filament_grams,
+            print_time_hours: print_time_hours ? String(print_time_hours) : prev.print_time_hours,
+            actual_cost: totalCost ? String(totalCost) : prev.actual_cost,
+            filament_data: filament_data ?? prev.filament_data,
+        }))
+        setShowOrderImport3mf(false)
     }
 
     // ── Confirm delivery: consume packaging then advance order ────
@@ -2318,7 +2360,43 @@ export default function Orders() {
                                 <div className="flex-1 h-px bg-slate-200" />
                             </div>
 
-                            {/* Filament + Print time */}
+                            {/* ── 3MF Import button ── */}
+                            <button
+                                type="button"
+                                onClick={() => setShowOrderImport3mf(true)}
+                                className="w-full flex items-center justify-center gap-2 py-3 border-2 border-dashed border-violet-300 hover:border-violet-400 hover:bg-violet-50 text-violet-600 rounded-xl text-sm font-semibold transition-all">
+                                📁 Import from .3mf file
+                                <span className="text-xs font-normal text-violet-400 hidden sm:inline">
+                                    — auto-fills filament & time
+                                </span>
+                            </button>
+
+                            {/* Show badge if data was imported */}
+                            {productionForm.filament_data?.length > 0 && (
+                                <div className="flex items-center gap-2 bg-violet-50 border border-violet-200 rounded-xl px-3 py-2">
+                                    <div className="flex gap-1">
+                                        {productionForm.filament_data
+                                            .filter(f => !f.is_support && f.color_hex)
+                                            .slice(0, 5)
+                                            .map((f, i) => (
+                                                <div key={i}
+                                                    className="w-4 h-4 rounded-sm border border-white shadow-sm flex-shrink-0"
+                                                    style={{ backgroundColor: f.color_hex }} />
+                                            ))}
+                                    </div>
+                                    <span className="text-xs text-violet-700 font-medium flex-1">
+                                        {productionForm.filament_data.length} color{productionForm.filament_data.length !== 1 ? 's' : ''} ·{' '}
+                                        {productionForm.filament_data.reduce((s, f) => s + f.grams, 0).toFixed(1)}g
+                                    </span>
+                                    <button
+                                        onClick={() => setProductionForm(f => ({ ...f, filament_data: null }))}
+                                        className="text-xs text-violet-400 hover:text-red-500 transition-colors">
+                                        ✕
+                                    </button>
+                                </div>
+                            )}
+
+                            {/* Filament + Print time — with auto-calculation */}
                             <div className="grid grid-cols-2 gap-3">
                                 <div>
                                     <label className="text-sm font-medium text-slate-600 block mb-1.5">
@@ -2431,6 +2509,12 @@ export default function Orders() {
                                 Cancel
                             </button>
                         </div>
+                        {/* 3MF Import modal — triggered from inside production modal */}
+                        {showOrderImport3mf && (
+                            <Import3mfModal
+                                onImport={handleOrderImport3mf}
+                                onClose={() => setShowOrderImport3mf(false)} />
+                        )}
                     </div>
                 </div>
             )}

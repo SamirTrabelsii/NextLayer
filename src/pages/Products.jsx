@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react'
 import { supabase } from '../lib/supabase'
-import { Plus, Pencil, Trash2, Search, X, Package, Box } from 'lucide-react'
+import { Plus, Pencil, Trash2, Search, X, Package, Box, Sparkles } from 'lucide-react'
 import { useSettings } from '../lib/SettingsContext'
 import ImageUpload from '../components/ImageUpload'
 import StlUpload from '../components/StlUpload'
@@ -31,6 +31,20 @@ export default function Products() {
 
     const { settings } = useSettings()
 
+    const [prodHistory, setProdHistory] = useState([])
+    const [loadingHist, setLoadingHist] = useState(false)
+
+    async function loadProductionHistory(productId) {
+        setLoadingHist(true)
+        const { data } = await supabase
+            .from('productions')
+            .select('id, status, filament_grams, support_grams, print_time_hours, actual_cost, filament_data, created_at, color, material')
+            .eq('product_id', productId)
+            .order('created_at', { ascending: false })
+        setProdHistory(data || [])
+        setLoadingHist(false)
+    }
+
     useEffect(() => { fetchProducts() }, [])
 
     async function fetchProducts() {
@@ -57,6 +71,7 @@ export default function Products() {
             .eq('product_id', p.id)
         setProductMaterials(bom || [])
         setShowModal(true)
+        loadProductionHistory(p.id)
     }
 
     function openAdd() {
@@ -212,31 +227,43 @@ export default function Products() {
                 </div>
             ) : (
                 <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-                    {filtered.map(p => (
-                        <div key={p.id} className={`bg-white rounded-2xl border p-4 shadow-sm hover:shadow-md transition-shadow
-              ${!p.is_active ? 'opacity-50' : ''}`}>
+                    {filtered.map(p => {
+                        const isCustomOrder = p.category === 'Custom Orders';
+                        return (
+                            <div key={p.id} className={`rounded-2xl border p-4 shadow-sm hover:shadow-md transition-all duration-300
+                  ${!p.is_active ? 'opacity-50' : ''}
+                  ${isCustomOrder
+                      ? 'bg-violet-50/70 dark:bg-violet-950/30 border-violet-200/80 hover:border-violet-300'
+                      : 'bg-white border-slate-200'
+                  }`}>
 
-                            {/* Product image */}
-                            {p.image_url && (
-                                <div className="mb-3 -mx-4 -mt-4 rounded-t-2xl overflow-hidden">
-                                    <img src={p.image_url} alt={p.name}
-                                        className="w-full h-36 object-cover" />
-                                </div>
-                            )}
-
-                            <div className="flex items-start justify-between mb-3">
-                                <div>
-                                    <div className="flex items-center gap-2 mb-1">
-                                        <span className="text-xs font-medium text-sky-600 bg-sky-50 px-2 py-0.5 rounded-full">
-                                            {p.category}
-                                        </span>
-                                        {p.stl_url && (
-                                            <a href={p.stl_url} download target="_blank" rel="noreferrer"
-                                                className="text-xs font-medium text-violet-600 bg-violet-50 px-2 py-0.5 rounded-full hover:bg-violet-100 transition-colors flex items-center gap-1">
-                                                <Box size={10} /> STL
-                                            </a>
-                                        )}
+                                {/* Product image */}
+                                {p.image_url && (
+                                    <div className="mb-3 -mx-4 -mt-4 rounded-t-2xl overflow-hidden">
+                                        <img src={p.image_url} alt={p.name}
+                                            className="w-full h-36 object-cover" />
                                     </div>
+                                )}
+
+                                <div className="flex items-start justify-between mb-3">
+                                    <div>
+                                        <div className="flex items-center gap-2 mb-1">
+                                            {isCustomOrder ? (
+                                                <span className="inline-flex items-center gap-1 text-xs font-semibold text-violet-700 bg-violet-100/80 border border-violet-200 px-2 py-0.5 rounded-full shadow-sm">
+                                                    <Sparkles size={10} className="text-violet-500 animate-pulse" /> {p.category}
+                                                </span>
+                                            ) : (
+                                                <span className="text-xs font-medium text-sky-600 bg-sky-50 px-2 py-0.5 rounded-full">
+                                                    {p.category}
+                                                </span>
+                                            )}
+                                            {p.stl_url && (
+                                                <a href={p.stl_url} download target="_blank" rel="noreferrer"
+                                                    className="text-xs font-medium text-violet-600 bg-violet-50 px-2 py-0.5 rounded-full hover:bg-violet-100 transition-colors flex items-center gap-1">
+                                                    <Box size={10} /> STL
+                                                </a>
+                                            )}
+                                        </div>
                                     <h3 className="font-semibold text-slate-800">{p.name}</h3>
                                     <p className="text-xs text-slate-400">{p.material}{p.color ? ` · ${p.color}` : ''}</p>
                                 </div>
@@ -252,7 +279,7 @@ export default function Products() {
                                 </div>
                             </div>
 
-                            <div className="grid grid-cols-2 gap-2 text-sm mt-3 pt-3 border-t border-slate-100">
+                                <div className="grid grid-cols-2 gap-2 text-sm mt-3 pt-3 border-t border-slate-100">
                                 <div>
                                     <p className="text-xs text-slate-400">Cost</p>
                                     <p className="font-semibold text-slate-700">
@@ -291,7 +318,7 @@ export default function Products() {
                                 )}
                             </div>
                         </div>
-                    ))}
+                    )})}
                 </div>
             )}
 
@@ -477,6 +504,90 @@ export default function Products() {
                                 </div>
                                 <span className="text-sm font-medium text-slate-700">Active product</span>
                             </label>
+
+                            {editing && (
+                                <div className="border-t border-slate-100 pt-4">
+                                    <p className="text-xs font-bold text-slate-400 uppercase tracking-wider mb-3">
+                                        🖨️ Production History
+                                    </p>
+
+                                    {loadingHist ? (
+                                        <p className="text-xs text-slate-400 text-center py-4">Loading...</p>
+                                    ) : prodHistory.length === 0 ? (
+                                        <p className="text-xs text-slate-400 text-center py-4">
+                                            No productions linked to this product yet.
+                                        </p>
+                                    ) : (
+                                        <div className="space-y-2">
+                                            {/* Combined cost */}
+                                            {(() => {
+                                                const donePrints = prodHistory.filter(p => p.status === 'done')
+                                                const totalCost  = donePrints.reduce((s, p) => s + (parseFloat(p.actual_cost) || 0), 0)
+                                                const totalGrams = donePrints.reduce((s, p) => s + (parseFloat(p.filament_grams) || 0), 0)
+                                                return donePrints.length > 0 ? (
+                                                    <div className="bg-sky-50 border border-sky-200 rounded-xl px-3 py-2.5 flex items-center justify-between mb-3">
+                                                        <div>
+                                                            <p className="text-xs font-bold text-sky-700">
+                                                                {donePrints.length} completed print job{donePrints.length !== 1 ? 's' : ''}
+                                                            </p>
+                                                            <p className="text-xs text-sky-500">{totalGrams.toFixed(0)}g total filament</p>
+                                                        </div>
+                                                        <div className="text-right">
+                                                            <p className="text-base font-bold text-sky-700">{totalCost.toFixed(2)} TND</p>
+                                                            <p className="text-xs text-sky-400">combined cost</p>
+                                                        </div>
+                                                    </div>
+                                                ) : null
+                                            })()}
+
+                                            {/* Individual print jobs */}
+                                            {prodHistory.map(p => (
+                                                <div key={p.id}
+                                                    className="flex items-center gap-3 bg-slate-50 rounded-xl px-3 py-2.5">
+                                                    {/* Status dot */}
+                                                    <div className={`w-2 h-2 rounded-full flex-shrink-0
+                                                        ${p.status === 'done'     ? 'bg-emerald-500'
+                                                        : p.status === 'printing' ? 'bg-yellow-400'
+                                                        : p.status === 'failed'   ? 'bg-red-400'
+                                                        :                          'bg-slate-300'}`} />
+
+                                                    {/* Color swatches from filament_data */}
+                                                    {p.filament_data?.length > 0 && (
+                                                        <div className="flex gap-0.5 flex-shrink-0">
+                                                            {p.filament_data.filter(f => !f.is_support).slice(0, 4).map((f, i) => (
+                                                                <div key={i} className="w-4 h-4 rounded-sm border border-white shadow-sm"
+                                                                    style={{ backgroundColor: f.color_hex || '#888' }} />
+                                                            ))}
+                                                        </div>
+                                                    )}
+
+                                                    {/* Stats */}
+                                                    <div className="flex-1 min-w-0">
+                                                        <p className="text-xs font-medium text-slate-700">
+                                                            {p.status.replace('_',' ')}
+                                                            {p.color && ` · ${p.color}`}
+                                                            {p.material && ` ${p.material}`}
+                                                        </p>
+                                                        <p className="text-xs text-slate-400">
+                                                            {new Date(p.created_at).toLocaleDateString('en-GB', { day:'2-digit', month:'short', year:'numeric' })}
+                                                            {p.filament_grams && ` · ${p.filament_grams}g`}
+                                                            {p.print_time_hours && ` · ${p.print_time_hours}h`}
+                                                        </p>
+                                                    </div>
+
+                                                    {/* Cost */}
+                                                    {p.actual_cost && (
+                                                        <p className={`text-xs font-bold flex-shrink-0
+                                                            ${p.status === 'done' ? 'text-emerald-600' : 'text-slate-400'}`}>
+                                                            {parseFloat(p.actual_cost).toFixed(2)} TND
+                                                        </p>
+                                                    )}
+                                                </div>
+                                            ))}
+                                        </div>
+                                    )}
+                                </div>
+                            )}
                         </div>
 
                         <div className="p-5 pt-0 flex gap-3">

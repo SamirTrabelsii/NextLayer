@@ -2,6 +2,9 @@ import { useState, useEffect } from 'react'
 import { supabase } from '../lib/supabase'
 import { Plus, X, Trash2, Printer, Clock, Zap, PackagePlus, ArrowRight } from 'lucide-react'
 import { useSettings } from '../lib/SettingsContext'
+import Import3mfModal from '../components/Import3mfModal'
+import { calcProductionCost } from '../lib/costUtils'
+import { deductFilamentFromSpools } from '../lib/filamentUtils'
 
 // ─── CONSTANTS ────────────────────────────────────────────────
 const STATUSES = [
@@ -35,6 +38,7 @@ const emptyForm = {
     order_id: '', product_id: '', description: '', quantity: 1,
     material: 'PLA', color: '', filament_grams: '',
     print_time_hours: '', actual_cost: '', status: 'queued', notes: '',
+    filament_data: null,
 }
 const emptyProduct = { name: '', category: 'Custom Orders', selling_price: '', production_cost: '' }
 
@@ -60,6 +64,32 @@ export default function Productions() {
 
     const { settings } = useSettings()
 
+    const [show3mf, setShow3mf] = useState(false)
+
+    function handle3mfImport(data) {
+        const { filament_grams, support_grams, print_time_hours, filament_data, _filament_cost } = data
+
+        // Full cost: filament (from spools/rate) + electricity + depreciation
+        const electricityCost = (parseFloat(print_time_hours) || 0) * (settings.electricity_per_hour || 0.15)
+        const machineRate = settings.machine_cost > 0 && settings.machine_lifespan_hours > 0
+            ? settings.machine_cost / settings.machine_lifespan_hours : 0
+        const nozzleRate = settings.nozzle_cost > 0 && settings.nozzle_lifespan_hours > 0
+            ? settings.nozzle_cost / settings.nozzle_lifespan_hours : 0
+        const depreciationCost = (parseFloat(print_time_hours) || 0) * (machineRate + nozzleRate)
+
+        const totalCost = (_filament_cost || 0) + electricityCost + depreciationCost
+
+        setForm(prev => ({
+            ...prev,
+            filament_grams: filament_grams || '',
+            support_grams: support_grams || '',
+            print_time_hours: print_time_hours || '',
+            actual_cost: parseFloat(totalCost.toFixed(3)) || '',
+            filament_data: filament_data,
+        }))
+        setShow3mf(false)
+    }
+
     useEffect(() => { fetchAll() }, [])
 
     // ─── FETCH ──────────────────────────────────────────────────
@@ -70,7 +100,7 @@ export default function Productions() {
                 supabase.from('productions').select(`
           id, order_id, product_id, description, quantity,
           material, color, filament_grams, print_time_hours,
-          actual_cost, status, notes, created_at,
+          actual_cost, status, notes, created_at, filament_data,
           orders(id, custom_description, type, status, clients(name)),
           products(id, name, production_cost)
         `).order('created_at', { ascending: false }),
@@ -117,6 +147,7 @@ export default function Productions() {
             actual_cost: p.actual_cost || '',
             status: p.status,
             notes: p.notes || '',
+            filament_data: p.filament_data || null,
         })
         setEditing(p.id)
         setShowModal(true)
@@ -190,6 +221,7 @@ export default function Productions() {
                 actual_cost: parseFloat(form.actual_cost) || null,
                 status: form.status,
                 notes: form.notes || null,
+                filament_data: form.filament_data || null,
             }
             if (editing) {
                 await supabase.from('productions').update(payload).eq('id', editing)
@@ -265,6 +297,9 @@ export default function Productions() {
                         .update({ production_cost: prod.actual_cost })
                         .eq('id', prod.product_id)
                 }
+
+                // ── Deduct from filament spools when Done ─────────────────
+                await deductFilamentFromSpools(prod)
 
                 // 3a. No order → add finished items to stock
                 if (!prod.order_id && prod.product_id) {
@@ -546,30 +581,44 @@ export default function Productions() {
                                         </div>
                                     </div>
 
-                                    {/* Stats row */}
-                                    {(p.filament_grams || p.print_time_hours || p.actual_cost) && (
-                                        <div className="flex flex-wrap gap-4 text-sm py-2.5 border-t border-b border-slate-50 mb-3">
-                                            {p.filament_grams && (
-                                                <div className="flex items-center gap-1.5 text-slate-600">
-                                                    <span>🧵</span>
-                                                    <span className="font-semibold">{p.filament_grams}g</span>
+                                    {/* Filament breakdown — from .3mf if available, otherwise simple display */}
+                                    {p.filament_data?.length > 0 ? (
+                                        <div className="flex flex-wrap gap-1.5 py-2.5 border-t border-b border-slate-50 mb-3">
+                                            {p.filament_data.map((f, i) => (
+                                                <div key={i} className="flex items-center gap-1.5 bg-slate-50 rounded-lg px-2 py-1">
+                                                    <span className="w-3 h-3 rounded-sm flex-shrink-0 border border-white shadow-sm"
+                                                        style={{ backgroundColor: f.is_support ? '#cbd5e1' : (f.color_hex || '#888') }} />
+                                                    <span className="text-xs text-slate-600 font-medium">
+                                                        {f.grams.toFixed(1)}g
+                                                    </span>
+                                                    {f.cost_tnd && (
+                                                        <span className="text-xs text-slate-400">{(f.cost_tnd).toFixed(2)} TND</span>
+                                                    )}
                                                 </div>
-                                            )}
-                                            {p.print_time_hours && (
-                                                <div className="flex items-center gap-1.5 text-slate-600">
-                                                    <Clock size={14} className="text-slate-400" />
-                                                    <span className="font-semibold">{p.print_time_hours}h</span>
-                                                </div>
-                                            )}
-                                            {p.actual_cost && (
-                                                <div className="flex items-center gap-1.5 text-slate-600">
-                                                    <Zap size={14} className="text-slate-400" />
-                                                    <span className="font-semibold">{p.actual_cost} TND</span>
-                                                    <span className="text-slate-400 text-xs">cost</span>
-                                                </div>
+                                            ))}
+                                            {(p.print_time_hours || p.actual_cost) && (
+                                                <>
+                                                    {p.print_time_hours && (
+                                                        <div className="flex items-center gap-1 bg-slate-50 rounded-lg px-2 py-1">
+                                                            <span className="text-xs text-slate-400">⏱</span>
+                                                            <span className="text-xs text-slate-600 font-medium">{p.print_time_hours}h</span>
+                                                        </div>
+                                                    )}
+                                                    {p.actual_cost && (
+                                                        <div className="flex items-center gap-1 bg-sky-50 rounded-lg px-2 py-1">
+                                                            <span className="text-xs font-bold text-sky-700">{p.actual_cost} TND</span>
+                                                        </div>
+                                                    )}
+                                                </>
                                             )}
                                         </div>
-                                    )}
+                                    ) : (p.filament_grams || p.print_time_hours || p.actual_cost) ? (
+                                        <div className="flex flex-wrap gap-4 text-sm py-2.5 border-t border-b border-slate-50 mb-3">
+                                            {p.filament_grams && <span className="text-slate-600 text-xs">🧵 {p.filament_grams}g</span>}
+                                            {p.print_time_hours && <span className="text-slate-600 text-xs">⏱ {p.print_time_hours}h</span>}
+                                            {p.actual_cost && <span className="font-bold text-sky-700 text-xs">{p.actual_cost} TND</span>}
+                                        </div>
+                                    ) : null}
 
                                     {/* Progress bar */}
                                     {p.status !== 'failed' && (
@@ -772,6 +821,31 @@ export default function Productions() {
                                 </div>
                             </div>
 
+                            {/* 3MF Import button */}
+                            <div>
+                                <button
+                                    type="button"
+                                    onClick={() => setShow3mf(true)}
+                                    className="w-full flex items-center justify-center gap-2 py-3 border-2 border-dashed border-violet-300 hover:border-violet-400 hover:bg-violet-50 text-violet-600 rounded-xl text-sm font-semibold transition-all">
+                                    📁 Import from .3mf file
+                                    <span className="text-xs font-normal text-violet-400">— auto-fills filament & time</span>
+                                </button>
+                                {form.filament_data && (
+                                    <div className="mt-2 flex items-center gap-2 bg-violet-50 border border-violet-200 rounded-xl px-3 py-2">
+                                        <span className="text-xs text-violet-700 font-medium flex-1">
+                                            ✅ {form.filament_data.length} color{form.filament_data.length !== 1 ? 's' : ''} imported
+                                            {' · '}{form.filament_data.reduce((s, f) => s + f.grams, 0).toFixed(1)}g total
+                                        </span>
+                                        <button
+                                            type="button"
+                                            onClick={() => setForm(f => ({ ...f, filament_data: null }))}
+                                            className="text-xs text-violet-400 hover:text-red-500 transition-colors">
+                                            ✕ clear
+                                        </button>
+                                    </div>
+                                )}
+                            </div>
+
                             {/* Filament + Time */}
                             <div className="grid grid-cols-2 gap-3">
                                 <div>
@@ -864,6 +938,12 @@ export default function Productions() {
                         </div>
                     </div>
                 </div>
+            )}
+
+            {show3mf && (
+                <Import3mfModal
+                    onImport={handle3mfImport}
+                    onClose={() => setShow3mf(false)} />
             )}
         </div>
     )

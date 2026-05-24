@@ -5,7 +5,7 @@ import {
   LayoutDashboard, ShoppingCart, Box, Users, Receipt,
   Lightbulb, Printer, Package, Handshake, Wrench,
   Settings as SettingsIcon, UserCog, LogOut, ChevronDown,
-  Sun, Moon
+  Sun, Moon, Layers
 } from 'lucide-react'
 import { useState } from 'react'
 import Logo from '../assets/logo.png'
@@ -17,6 +17,7 @@ const ADMIN_NAV = [
   { to: '/productions', icon: Printer,         label: 'Production' },
   { to: '/stock',       icon: Package,         label: 'Stock'      },
   { to: '/materials',   icon: Wrench,          label: 'Materials'  },
+  { to: '/filaments',   icon: Layers,          label: 'Filaments'  },
   { to: '/products',    icon: Box,             label: 'Catalogue'  },
   { to: '/clients',     icon: Users,           label: 'Clients'    },
   { to: '/reseller',    icon: Handshake,       label: 'Reseller'   },

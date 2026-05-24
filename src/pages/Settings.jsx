@@ -80,6 +80,7 @@ export default function Settings() {
             await supabase.from('productions').delete().not('id', 'is', null)
             await supabase.from('stock_movements').delete().not('id', 'is', null)
             await supabase.from('material_movements').delete().not('id', 'is', null)
+            await supabase.from('filament_spool_logs').delete().not('id', 'is', null)
 
             // 2. Delete reseller components
             await supabase.from('reseller_sales').delete().not('id', 'is', null)
@@ -93,6 +94,7 @@ export default function Settings() {
             // 4. Delete auxiliary records
             await supabase.from('stock').delete().not('id', 'is', null)
             await supabase.from('materials').delete().not('id', 'is', null)
+            await supabase.from('filament_spools').delete().not('id', 'is', null)
             await supabase.from('expenses').delete().not('id', 'is', null)
             await supabase.from('ideas').delete().not('id', 'is', null)
 
@@ -232,7 +234,7 @@ export default function Settings() {
                                 🚨 Danger Zone: Platform Factory Reset
                             </h3>
                             <p className="text-xs text-slate-500 dark:text-slate-400 max-w-lg leading-relaxed">
-                                Erase all operational data: clients, resellers, orders, reseller consignments, production logs, stock levels, raw materials database, expenses, and ideas. This action is irreversible. Your cost configuration parameters above will be kept.
+                                Erase all operational data: clients, resellers, orders, reseller consignments, production logs, stock levels, raw materials database, filaments database, expenses, and ideas. This action is irreversible. Your cost configuration parameters above will be kept.
                             </p>
                         </div>
                         <button
@@ -265,6 +267,7 @@ export default function Settings() {
                             <div>❌ Production Logs</div>
                             <div>❌ Raw Materials & BOMs</div>
                             <div>❌ Stocks & Movements</div>
+                            <div>❌ Filaments & Spool Logs</div>
                             <div>❌ Logged Expenses</div>
                             <div>❌ Ideation Board</div>
                         </div>

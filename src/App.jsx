@@ -14,6 +14,7 @@ import Expenses        from './pages/Expenses'
 import Ideas           from './pages/Ideas'
 import Settings        from './pages/Settings'
 import UserManagement  from './pages/UserManagement'
+import Filaments       from './pages/Filaments'
 
 export default function App() {
   return (
@@ -49,6 +50,7 @@ export default function App() {
             { path: 'productions', el: <Productions />    },
             { path: 'stock',       el: <Stock />          },
             { path: 'materials',   el: <Materials />      },
+            { path: 'filaments',   el: <Filaments />      },
             { path: 'products',    el: <Products />       },
             { path: 'clients',     el: <Clients />        },
             { path: 'expenses',    el: <Expenses />       },
