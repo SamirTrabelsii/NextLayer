@@ -356,7 +356,7 @@ export default function Orders() {
         try {
             const [{ data: o, error: e1 }, { data: c }, { data: p }] = await Promise.all([
                 supabase.from('orders').select(`
-          id, type, status, total_price, is_paid, deadline, notes,
+          id, type, status, total_price, is_paid, paid_at, deadline, notes,
           custom_description, dimensions, reference_notes, reference_image_url, stl_url, created_at,
           clients(id, name, phone),
           order_items(id, quantity, unit_price, custom_description, product_id, products(id, name))
@@ -872,6 +872,7 @@ export default function Orders() {
             setSaving(false)
         }
     }
+
     async function saveOrderEdit() {
         if (!selected) return
         setSavingEdit(true)
@@ -884,6 +885,13 @@ export default function Orders() {
             reference_notes: editForm.reference_notes || null,
             reference_image_url: editForm.reference_image_url || null,
             stl_url: editForm.stl_url || null,
+            // ── Payment fields ──────────────────────────────────────
+            is_paid: editForm.is_paid,
+            paid_at: editForm.is_paid && editForm.paid_at
+                ? new Date(editForm.paid_at + 'T12:00:00').toISOString()
+                : editForm.is_paid && !editForm.paid_at
+                    ? new Date().toISOString()
+                    : null,
         }
         const { error } = await supabase.from('orders')
             .update(payload).eq('id', selected.id)
@@ -1858,7 +1866,7 @@ export default function Orders() {
                             })()}
 
                             {/* ── EDIT TOGGLE ── */}
-                            {!TERMINAL.includes(selected.status) && !editingOrder && (
+                            {(!TERMINAL.includes(selected.status) || selected.status === 'paid') && !editingOrder && (
                                 <button
                                     onClick={() => {
                                         setEditForm({
@@ -1870,6 +1878,12 @@ export default function Orders() {
                                             reference_notes: selected.reference_notes || '',
                                             reference_image_url: selected.reference_image_url || '',
                                             stl_url: selected.stl_url || '',
+                                            is_paid: selected.is_paid ?? false,
+                                            paid_at: selected.paid_at
+                                                ? new Date(selected.paid_at)
+                                                    .toISOString()
+                                                    .slice(0, 10)
+                                                : '',
                                         })
                                         setEditingOrder(true)
                                     }}
@@ -1914,7 +1928,59 @@ export default function Orders() {
                                             onChange={e => setEditForm(f => ({ ...f, deadline: e.target.value }))}
                                             className="w-full border border-slate-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-sky-300 bg-white" />
                                     </div>
+                                    {/* Payment status + date — only relevant for paid or ready-to-pay orders */}
+                                    <div className="border-t border-slate-100 pt-3 space-y-3">
+                                        <p className="text-xs font-bold text-slate-400 uppercase tracking-wider">
+                                            Payment
+                                        </p>
 
+                                        {/* Toggle paid status */}
+                                        <div className="flex items-center justify-between">
+                                            <div>
+                                                <p className="text-sm font-medium text-slate-700">Marked as paid</p>
+                                                <p className="text-xs text-slate-400">
+                                                    Affects revenue in dashboard stats
+                                                </p>
+                                            </div>
+                                            <button
+                                                type="button"
+                                                onClick={() => setEditForm(f => ({
+                                                    ...f,
+                                                    is_paid: !f.is_paid,
+                                                    // If marking paid now and no date set, default to today
+                                                    paid_at: !f.is_paid && !f.paid_at
+                                                        ? new Date().toISOString().slice(0, 10)
+                                                        : f.paid_at,
+                                                }))}
+                                                className={`relative w-11 h-6 rounded-full transition-colors flex-shrink-0
+        ${editForm.is_paid ? 'bg-emerald-500' : 'bg-slate-200'}`}>
+                                                <div className={`absolute top-0.5 w-5 h-5 bg-white rounded-full shadow
+        transition-transform
+        ${editForm.is_paid ? 'translate-x-5' : 'translate-x-0.5'}`} />
+                                            </button>
+                                        </div>
+
+                                        {/* Payment date — only show when paid */}
+                                        {editForm.is_paid && (
+                                            <div>
+                                                <label className="text-sm font-medium text-slate-700 block mb-1.5">
+                                                    Payment date
+                                                    <span className="text-xs text-slate-400 font-normal ml-1">
+                                                        — used for revenue stats
+                                                    </span>
+                                                </label>
+                                                <input
+                                                    type="date"
+                                                    value={editForm.paid_at || ''}
+                                                    onChange={e => setEditForm(f => ({ ...f, paid_at: e.target.value }))}
+                                                    className="w-full border-2 border-slate-200 focus:border-sky-400
+          rounded-xl px-3 py-2.5 text-sm focus:outline-none transition-colors" />
+                                                <p className="text-xs text-slate-400 mt-1">
+                                                    This date determines which month the revenue appears in.
+                                                </p>
+                                            </div>
+                                        )}
+                                    </div>
                                     {/* Custom order fields */}
                                     {selected.type === 'custom' && (
                                         <>
