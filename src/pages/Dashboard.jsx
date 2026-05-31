@@ -261,11 +261,23 @@ export default function Dashboard() {
                     <h1 className="text-2xl font-bold text-slate-800">Dashboard</h1>
                     <p className="text-sm text-slate-500">{monthName}</p>
                 </div>
-                <button onClick={fetchAll}
-                    className="text-xs text-slate-400 hover:text-sky-500 px-3 py-2 rounded-xl hover:bg-sky-50 transition-colors">
-                    ↻ Refresh
-                </button>
+                <div className="flex items-center gap-3">
+                    <button onClick={() => navigate('/analytics')}
+                        className="hidden sm:flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-bold text-white bg-gradient-to-r from-indigo-500 to-purple-600 hover:from-indigo-600 hover:to-purple-700 shadow-md hover:shadow-lg transition-all hover:-translate-y-0.5">
+                        <BarChart size={16} /> View Full Analytics
+                    </button>
+                    <button onClick={fetchAll}
+                        className="text-xs text-slate-400 hover:text-sky-500 px-3 py-2 rounded-xl hover:bg-sky-50 transition-colors">
+                        ↻ Refresh
+                    </button>
+                </div>
             </div>
+
+            {/* Mobile analytics button */}
+            <button onClick={() => navigate('/analytics')}
+                className="sm:hidden w-full flex items-center justify-center gap-2 px-4 py-3 rounded-2xl text-sm font-bold text-white bg-gradient-to-r from-indigo-500 to-purple-600 hover:from-indigo-600 hover:to-purple-700 shadow-md mb-2">
+                <BarChart size={16} /> View Full Analytics
+            </button>
 
             {/* ── QUICK ACTIONS ── */}
             <div>
@@ -456,134 +468,134 @@ export default function Dashboard() {
 
 // ─── RESELLER DASHBOARD ───────────────────────────────────────
 function ResellerDashboard({ resellerId }) {
-  const navigate                  = useNavigate()
-  const [data, setData]           = useState(null)
-  const [loading, setLoading]     = useState(true)
+    const navigate = useNavigate()
+    const [data, setData] = useState(null)
+    const [loading, setLoading] = useState(true)
 
-  useEffect(() => {
-    if (resellerId) fetchResellerData()
-    else setLoading(false)
-  }, [resellerId])
+    useEffect(() => {
+        if (resellerId) fetchResellerData()
+        else setLoading(false)
+    }, [resellerId])
 
-  async function fetchResellerData() {
-    setLoading(true)
-    const [{ data: consignments }, { data: allSales }] = await Promise.all([
-      supabase.from('reseller_consignments')
-        .select('*, products(name)')
-        .eq('reseller_id', resellerId)
-        .eq('is_settled', false),
-      supabase.from('reseller_sales')
-        .select('*, products(name)')
-        .eq('reseller_id', resellerId)
-        .order('sale_date', { ascending: false }),
-    ])
+    async function fetchResellerData() {
+        setLoading(true)
+        const [{ data: consignments }, { data: allSales }] = await Promise.all([
+            supabase.from('reseller_consignments')
+                .select('*, products(name)')
+                .eq('reseller_id', resellerId)
+                .eq('is_settled', false),
+            supabase.from('reseller_sales')
+                .select('*, products(name)')
+                .eq('reseller_id', resellerId)
+                .order('sale_date', { ascending: false }),
+        ])
 
-    const active    = consignments || []
-    const sales     = allSales     || []
+        const active = consignments || []
+        const sales = allSales || []
 
-    const inHands   = active.reduce((s, c) =>
-      s + Math.max(0, c.quantity_given - c.quantity_sold - c.quantity_returned), 0)
-    const owedTotal = sales
-      .filter(s => active.find(c => c.id === s.consignment_id))
-      .reduce((sum, s) => sum + (s.total || 0), 0)
+        const inHands = active.reduce((s, c) =>
+            s + Math.max(0, c.quantity_given - c.quantity_sold - c.quantity_returned), 0)
+        const owedTotal = sales
+            .filter(s => active.find(c => c.id === s.consignment_id))
+            .reduce((sum, s) => sum + (s.total || 0), 0)
 
-    const now        = new Date().toISOString().slice(0, 7)
-    const thisMonth  = sales.filter(s => s.sale_date?.startsWith(now))
-      .reduce((sum, s) => sum + (s.total || 0), 0)
+        const now = new Date().toISOString().slice(0, 7)
+        const thisMonth = sales.filter(s => s.sale_date?.startsWith(now))
+            .reduce((sum, s) => sum + (s.total || 0), 0)
 
-    setData({ active, sales: sales.slice(0, 8), inHands, owedTotal, thisMonth })
-    setLoading(false)
-  }
+        setData({ active, sales: sales.slice(0, 8), inHands, owedTotal, thisMonth })
+        setLoading(false)
+    }
 
-  if (loading) return (
-    <div className="flex items-center justify-center h-64 text-slate-400">Loading...</div>
-  )
-  if (!resellerId) return (
-    <div className="text-center py-20 text-slate-400">Account not linked. Contact admin.</div>
-  )
+    if (loading) return (
+        <div className="flex items-center justify-center h-64 text-slate-400">Loading...</div>
+    )
+    if (!resellerId) return (
+        <div className="text-center py-20 text-slate-400">Account not linked. Contact admin.</div>
+    )
 
-  const d = data
-  const fmt = date => new Date(date).toLocaleDateString('en-GB', { day:'2-digit', month:'short' })
+    const d = data
+    const fmt = date => new Date(date).toLocaleDateString('en-GB', { day: '2-digit', month: 'short' })
 
-  return (
-    <div className="max-w-2xl mx-auto space-y-5">
-      <div>
-        <h1 className="text-2xl font-bold text-slate-800">My Sales</h1>
-        <p className="text-sm text-slate-400">Your reseller dashboard</p>
-      </div>
+    return (
+        <div className="max-w-2xl mx-auto space-y-5">
+            <div>
+                <h1 className="text-2xl font-bold text-slate-800">My Sales</h1>
+                <p className="text-sm text-slate-400">Your reseller dashboard</p>
+            </div>
 
-      {/* KPIs */}
-      <div className="grid grid-cols-3 gap-3">
-        <div className="bg-white rounded-2xl border border-slate-100 shadow-sm p-4 text-center">
-          <p className="text-2xl font-bold text-purple-600">{d.inHands}</p>
-          <p className="text-xs text-slate-400 mt-0.5">In your hands</p>
-        </div>
-        <div className="bg-white rounded-2xl border border-slate-100 shadow-sm p-4 text-center">
-          <p className="text-xl font-bold text-emerald-600">{d.thisMonth.toFixed(2)}</p>
-          <p className="text-xs text-slate-400 mt-0.5">TND this month</p>
-        </div>
-        <div className="bg-gradient-to-br from-purple-500 to-purple-700 rounded-2xl p-4 text-center text-white">
-          <p className="text-xl font-bold">{d.owedTotal.toFixed(2)}</p>
-          <p className="text-xs text-purple-200 mt-0.5">TND owed to admin</p>
-        </div>
-      </div>
+            {/* KPIs */}
+            <div className="grid grid-cols-3 gap-3">
+                <div className="bg-white rounded-2xl border border-slate-100 shadow-sm p-4 text-center">
+                    <p className="text-2xl font-bold text-purple-600">{d.inHands}</p>
+                    <p className="text-xs text-slate-400 mt-0.5">In your hands</p>
+                </div>
+                <div className="bg-white rounded-2xl border border-slate-100 shadow-sm p-4 text-center">
+                    <p className="text-xl font-bold text-emerald-600">{d.thisMonth.toFixed(2)}</p>
+                    <p className="text-xs text-slate-400 mt-0.5">TND this month</p>
+                </div>
+                <div className="bg-gradient-to-br from-purple-500 to-purple-700 rounded-2xl p-4 text-center text-white">
+                    <p className="text-xl font-bold">{d.owedTotal.toFixed(2)}</p>
+                    <p className="text-xs text-purple-200 mt-0.5">TND owed to admin</p>
+                </div>
+            </div>
 
-      {/* Active consignments */}
-      {d.active.length > 0 && (
-        <div className="bg-white rounded-2xl border border-slate-100 shadow-sm p-5">
-          <h2 className="font-bold text-slate-800 mb-4">Products in your hands</h2>
-          <div className="space-y-3">
-            {d.active.map(c => {
-              const remaining = c.quantity_given - c.quantity_sold - c.quantity_returned
-              const pct = c.quantity_given > 0 ? ((c.quantity_sold || 0) / c.quantity_given * 100) : 0
-              return (
-                <div key={c.id} className="flex items-center gap-3">
-                  <div className="flex-1 min-w-0">
-                    <p className="text-sm font-semibold text-slate-800">{c.products?.name}</p>
-                    <div className="flex items-center gap-2 mt-1">
-                      <div className="flex-1 h-1.5 bg-slate-100 rounded-full overflow-hidden">
-                        <div className="h-full bg-emerald-400 rounded-full"
-                          style={{ width: `${pct}%` }} />
-                      </div>
-                      <span className="text-xs text-slate-400 flex-shrink-0">
-                        {c.quantity_sold || 0}/{c.quantity_given} sold
-                      </span>
-                    </div>
-                  </div>
-                  <div className="text-right flex-shrink-0">
-                    <span className={`text-xs font-bold px-2 py-1 rounded-lg
+            {/* Active consignments */}
+            {d.active.length > 0 && (
+                <div className="bg-white rounded-2xl border border-slate-100 shadow-sm p-5">
+                    <h2 className="font-bold text-slate-800 mb-4">Products in your hands</h2>
+                    <div className="space-y-3">
+                        {d.active.map(c => {
+                            const remaining = c.quantity_given - c.quantity_sold - c.quantity_returned
+                            const pct = c.quantity_given > 0 ? ((c.quantity_sold || 0) / c.quantity_given * 100) : 0
+                            return (
+                                <div key={c.id} className="flex items-center gap-3">
+                                    <div className="flex-1 min-w-0">
+                                        <p className="text-sm font-semibold text-slate-800">{c.products?.name}</p>
+                                        <div className="flex items-center gap-2 mt-1">
+                                            <div className="flex-1 h-1.5 bg-slate-100 rounded-full overflow-hidden">
+                                                <div className="h-full bg-emerald-400 rounded-full"
+                                                    style={{ width: `${pct}%` }} />
+                                            </div>
+                                            <span className="text-xs text-slate-400 flex-shrink-0">
+                                                {c.quantity_sold || 0}/{c.quantity_given} sold
+                                            </span>
+                                        </div>
+                                    </div>
+                                    <div className="text-right flex-shrink-0">
+                                        <span className={`text-xs font-bold px-2 py-1 rounded-lg
                       ${remaining > 0 ? 'bg-purple-100 text-purple-700' : 'bg-emerald-100 text-emerald-700'}`}>
-                      {remaining > 0 ? `${remaining} left` : 'All sold'}
-                    </span>
-                  </div>
+                                            {remaining > 0 ? `${remaining} left` : 'All sold'}
+                                        </span>
+                                    </div>
+                                </div>
+                            )
+                        })}
+                    </div>
+                    <button onClick={() => navigate('/reseller')}
+                        className="mt-4 w-full py-2.5 bg-emerald-500 hover:bg-emerald-600 text-white rounded-xl text-sm font-semibold transition-colors">
+                        💰 Report a Sale
+                    </button>
                 </div>
-              )
-            })}
-          </div>
-          <button onClick={() => navigate('/reseller')}
-            className="mt-4 w-full py-2.5 bg-emerald-500 hover:bg-emerald-600 text-white rounded-xl text-sm font-semibold transition-colors">
-            💰 Report a Sale
-          </button>
-        </div>
-      )}
+            )}
 
-      {/* Recent sales */}
-      {d.sales.length > 0 && (
-        <div className="bg-white rounded-2xl border border-slate-100 shadow-sm p-5">
-          <h2 className="font-bold text-slate-800 mb-4">Recent Sales</h2>
-          <div className="space-y-2">
-            {d.sales.map(s => (
-              <div key={s.id} className="flex items-center justify-between py-2 border-b border-slate-50 last:border-0">
-                <div>
-                  <p className="text-sm font-medium text-slate-700">{s.products?.name || '—'}</p>
-                  <p className="text-xs text-slate-400">{fmt(s.sale_date)} · ×{s.quantity} @ {s.unit_price} TND</p>
+            {/* Recent sales */}
+            {d.sales.length > 0 && (
+                <div className="bg-white rounded-2xl border border-slate-100 shadow-sm p-5">
+                    <h2 className="font-bold text-slate-800 mb-4">Recent Sales</h2>
+                    <div className="space-y-2">
+                        {d.sales.map(s => (
+                            <div key={s.id} className="flex items-center justify-between py-2 border-b border-slate-50 last:border-0">
+                                <div>
+                                    <p className="text-sm font-medium text-slate-700">{s.products?.name || '—'}</p>
+                                    <p className="text-xs text-slate-400">{fmt(s.sale_date)} · ×{s.quantity} @ {s.unit_price} TND</p>
+                                </div>
+                                <p className="font-bold text-emerald-600 text-sm">{parseFloat(s.total || 0).toFixed(2)} TND</p>
+                            </div>
+                        ))}
+                    </div>
                 </div>
-                <p className="font-bold text-emerald-600 text-sm">{parseFloat(s.total || 0).toFixed(2)} TND</p>
-              </div>
-            ))}
-          </div>
+            )}
         </div>
-      )}
-    </div>
-  )
+    )
 }

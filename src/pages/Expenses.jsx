@@ -7,6 +7,9 @@ const CATEGORIES = [
     { key: 'electricity', label: 'Electricity', emoji: '⚡', color: 'bg-yellow-100 text-yellow-700' },
     { key: 'material', label: 'Materials & Supplies', emoji: '🔩', color: 'bg-purple-100 text-purple-700' },
     { key: 'shipping', label: 'Shipping', emoji: '📦', color: 'bg-orange-100 text-orange-700' },
+    { key: 'investment', label: 'Investment (Printers)', emoji: '🖨️', color: 'bg-emerald-100 text-emerald-700' },
+    { key: 'marketing', label: 'Marketing & Ads', emoji: '📈', color: 'bg-pink-100 text-pink-700' },
+    { key: 'impression', label: 'Impression', emoji: '🏷️', color: 'bg-indigo-100 text-indigo-700' },
     { key: 'other', label: 'Other', emoji: '💼', color: 'bg-slate-100 text-slate-600' },
 ]
 
