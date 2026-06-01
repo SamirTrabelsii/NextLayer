@@ -1115,13 +1115,140 @@ export default function Orders() {
 
     // ─── DELETE ORDER ─────────────────────────────────────────────
     async function deleteOrder(id) {
+        setSaving(true)
+        setError('')
         try {
+
+            // ── 1. Restore stock from standard order ─────────────────
+            const { data: stockMoves } = await supabase
+                .from('stock_movements')
+                .select('id, product_id, quantity')
+                .eq('order_id', id)
+                .eq('type', 'sold')
+
+            for (const m of stockMoves || []) {
+                const { data: row } = await supabase
+                    .from('stock')
+                    .select('id, quantity_available')
+                    .eq('product_id', m.product_id)
+                    .maybeSingle()
+                if (row) {
+                    await supabase.from('stock').update({
+                        quantity_available: (row.quantity_available || 0) + m.quantity,
+                        updated_at: new Date().toISOString(),
+                    }).eq('id', row.id)
+                }
+            }
+            // Delete the movement records themselves
+            if ((stockMoves || []).length > 0) {
+                await supabase
+                    .from('stock_movements')
+                    .delete()
+                    .eq('order_id', id)
+            }
+
+            // ── 2. Restore packaging materials (logged at delivery) ───
+            const { data: packMoves } = await supabase
+                .from('material_movements')
+                .select('id, material_id, quantity')
+                .eq('order_id', id)
+                .eq('type', 'used')
+
+            for (const m of packMoves || []) {
+                const { data: mat } = await supabase
+                    .from('materials')
+                    .select('id, quantity_available')
+                    .eq('id', m.material_id)
+                    .maybeSingle()
+                if (mat) {
+                    await supabase.from('materials').update({
+                        quantity_available: (mat.quantity_available || 0) + m.quantity,
+                    }).eq('id', mat.id)
+                }
+            }
+            // Delete packaging movement records
+            if ((packMoves || []).length > 0) {
+                await supabase
+                    .from('material_movements')
+                    .delete()
+                    .eq('order_id', id)
+            }
+
+            // ── 3. Handle productions ─────────────────────────────────
+            const { data: prods } = await supabase
+                .from('productions')
+                .select('id, status, product_id, quantity')
+                .eq('order_id', id)
+
+            for (const prod of prods || []) {
+                if (prod.status === 'done') {
+
+                    // 3a. Restore filament spools
+                    const { data: spoolLogs } = await supabase
+                        .from('filament_spool_logs')
+                        .select('spool_id, grams_used')
+                        .eq('production_id', prod.id)
+
+                    for (const log of spoolLogs || []) {
+                        const { data: spool } = await supabase
+                            .from('filament_spools')
+                            .select('id, current_weight_g')
+                            .eq('id', log.spool_id)
+                            .maybeSingle()
+                        if (spool) {
+                            await supabase.from('filament_spools').update({
+                                current_weight_g:
+                                    (spool.current_weight_g || 0) + log.grams_used,
+                            }).eq('id', spool.id)
+                        }
+                    }
+
+                    // Delete spool logs
+                    await supabase
+                        .from('filament_spool_logs')
+                        .delete()
+                        .eq('production_id', prod.id)
+
+                    // 3b. Restore BOM materials consumed by this production
+                    if (prod.product_id) {
+                        const qty = parseInt(prod.quantity) || 1
+                        const { data: bom } = await supabase
+                            .from('product_materials')
+                            .select('material_id, quantity_per_unit, materials(id, quantity_available)')
+                            .eq('product_id', prod.product_id)
+
+                        for (const b of bom || []) {
+                            const mat = b.materials
+                            if (mat) {
+                                await supabase.from('materials').update({
+                                    quantity_available:
+                                        (mat.quantity_available || 0) +
+                                        (b.quantity_per_unit || 1) * qty,
+                                }).eq('id', mat.id)
+                            }
+                        }
+                    }
+                }
+
+                // Delete the production
+                await supabase.from('productions').delete().eq('id', prod.id)
+            }
+
+            // ── 4. Explicitly delete order_items (CASCADE safety net) ─
+            await supabase.from('order_items').delete().eq('order_id', id)
+
+            // ── 5. Delete the order ───────────────────────────────────
             await supabase.from('orders').delete().eq('id', id)
+
             setDeleting(null)
             setSelected(null)
             await fetchAll()
+
         } catch (err) {
-            console.error(err)
+            console.error('deleteOrder error:', err)
+            setError('Failed to delete order cleanly. Please try again.')
+        } finally {
+            setSaving(false)
         }
     }
 
@@ -2335,22 +2462,40 @@ export default function Orders() {
 
             {/* ── DELETE CONFIRM ── */}
             {deleting && (
-                <div className="fixed inset-0 bg-black/60 z-[60] flex items-center justify-center p-4">
+                <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
                     <div className="bg-white rounded-2xl shadow-2xl p-6 max-w-sm w-full">
-                        <h3 className="font-bold text-slate-800 text-lg mb-1">Delete this order?</h3>
-                        <p className="text-slate-500 text-sm mb-1">
+                        <h3 className="font-bold text-slate-800 text-lg mb-1">Delete order?</h3>
+                        <p className="text-slate-500 text-sm mb-3">
                             Order for <span className="font-semibold">{deleting.clients?.name}</span> will be permanently deleted.
                         </p>
-                        {deleting.type === 'custom' && (
-                            <p className="text-xs text-red-500 mb-5">⚠️ All linked print jobs will also be deleted.</p>
-                        )}
+
+                        {/* Show exactly what will be reversed */}
+                        <div className="bg-red-50 border border-red-200 rounded-xl p-3 mb-5 space-y-1">
+                            <p className="text-xs font-bold text-red-700 mb-1.5">This will also:</p>
+                            {deleting.status === 'paid' && (
+                                <p className="text-xs text-red-600">💰 Remove from revenue &amp; income stats</p>
+                            )}
+                            {deleting.type === 'standard' && ['ready', 'delivered', 'paid'].includes(deleting.status) && (
+                                <p className="text-xs text-red-600">📦 Restore stock quantities</p>
+                            )}
+                            {deleting.type === 'custom' && (
+                                <p className="text-xs text-red-600">🖨️ Delete linked print job(s)</p>
+                            )}
+                            {['delivered', 'paid'].includes(deleting.status) && (
+                                <p className="text-xs text-red-600">🧴 Restore packaging materials used</p>
+                            )}
+                            {deleting.type === 'custom' && ['ready', 'delivered', 'paid'].includes(deleting.status) && (
+                                <p className="text-xs text-red-600">🧵 Restore filament &amp; BOM materials</p>
+                            )}
+                        </div>
+
                         <div className="flex gap-3">
                             <button onClick={() => setDeleting(null)}
                                 className="flex-1 py-2.5 border border-slate-200 rounded-xl text-sm font-medium hover:bg-slate-50">
-                                Keep it
+                                Cancel
                             </button>
                             <button onClick={() => deleteOrder(deleting.id)}
-                                className="flex-1 py-2.5 bg-red-500 hover:bg-red-600 text-white rounded-xl text-sm font-semibold">
+                                className="flex-1 py-2.5 bg-red-500 hover:bg-red-600 text-white rounded-xl text-sm font-bold">
                                 Delete
                             </button>
                         </div>
