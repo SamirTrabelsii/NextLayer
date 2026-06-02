@@ -2,7 +2,6 @@ import { useState, useEffect } from 'react'
 import { supabase } from '../lib/supabase'
 import { Plus, X, Package, History } from 'lucide-react'
 
-// Manual movement types only — stock added automatically via productions
 const MANUAL_TYPES = [
   { key: 'adjustment', label: 'Stock Adjustment', emoji: '⚙️', color: 'text-slate-600', sign: 1, desc: 'Correction, found more stock' },
   { key: 'damaged', label: 'Damaged', emoji: '💔', color: 'text-red-500', sign: -1, desc: 'Broken or unusable products' },
@@ -10,7 +9,6 @@ const MANUAL_TYPES = [
   { key: 'lost', label: 'Lost', emoji: '❓', color: 'text-orange-500', sign: -1, desc: 'Missing / lost products' },
 ]
 
-// All movement types for display in history
 const ALL_TYPES = {
   produced: { label: 'Produced', emoji: '✅', sign: 1 },
   sold: { label: 'Sold', emoji: '💰', sign: -1 },
@@ -22,7 +20,10 @@ const ALL_TYPES = {
   lost: { label: 'Lost', emoji: '❓', sign: -1 },
 }
 
+const CATEGORIES = ['Keychains', 'Clickers', 'Decorations', 'Custom Orders', 'Other']
+
 const emptyForm = { product_id: '', type: 'adjustment', quantity: 1, is_positive: true, notes: '' }
+const emptyNewProduct = { name: '', category: 'Keychains', selling_price: '' }
 
 export default function Stock() {
   const [stock, setStock] = useState([])
@@ -35,6 +36,11 @@ export default function Stock() {
   const [saving, setSaving] = useState(false)
   const [search, setSearch] = useState('')
   const [error, setError] = useState('')
+
+  // Inline product creation
+  const [showNewProduct, setShowNewProduct] = useState(false)
+  const [newProduct, setNewProduct] = useState(emptyNewProduct)
+  const [savingProduct, setSavingProduct] = useState(false)
 
   useEffect(() => { fetchAll() }, [])
 
@@ -63,7 +69,6 @@ export default function Stock() {
     const { data: existing } = await supabase.from('stock')
       .select('*').eq('product_id', form.product_id).single()
 
-    // Check if enough stock for negative movements
     if (!isPlus) {
       const avail = existing?.quantity_available || 0
       if (avail < qty) {
@@ -73,7 +78,6 @@ export default function Stock() {
       }
     }
 
-    // Log movement
     await supabase.from('stock_movements').insert([{
       product_id: form.product_id,
       type: form.type,
@@ -82,7 +86,6 @@ export default function Stock() {
       notes: form.notes,
     }])
 
-    // Update stock
     if (existing) {
       await supabase.from('stock').update({
         quantity_available: Math.max(0, (existing.quantity_available || 0) + (isPlus ? qty : -qty)),
@@ -102,29 +105,54 @@ export default function Stock() {
     fetchAll()
   }
 
+  async function createProductInline() {
+    if (!newProduct.name.trim()) return
+    setSavingProduct(true)
+    try {
+      const { data, error: err } = await supabase.from('products').insert([{
+        name: newProduct.name.trim(),
+        category: newProduct.category,
+        selling_price: parseFloat(newProduct.selling_price) || null,
+        is_active: true,
+      }]).select().single()
+      if (err) throw err
+      setProducts(prev => [...prev, data].sort((a, b) => a.name.localeCompare(b.name)))
+      setForm(f => ({ ...f, product_id: data.id }))
+      setShowNewProduct(false)
+      setNewProduct(emptyNewProduct)
+    } catch (err) {
+      console.error(err)
+      setError('Failed to create product.')
+    } finally {
+      setSavingProduct(false)
+    }
+  }
+
   const filtered = stock.filter(s =>
     s.products?.name?.toLowerCase().includes(search.toLowerCase())
   )
 
-  const totalAvailable = stock.reduce((s, i) => s + (i.quantity_available || 0), 0)
-  const totalReseller = stock.reduce((s, i) => s + (i.quantity_with_reseller || 0), 0)
   const lowStock = stock.filter(s => s.quantity_available > 0 && s.quantity_available <= 2)
   const outOfStock = stock.filter(s => s.quantity_available === 0)
 
   const productMovements = pid => movements.filter(m => m.product_id === pid)
 
-  const fmt = d => new Date(d).toLocaleDateString('en-GB', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' })
+  const fmt = d => new Date(d).toLocaleDateString('en-GB', {
+    day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit',
+  })
 
   const movTypeInfo = key => ALL_TYPES[key] || { label: key, emoji: '•', sign: 1 }
 
   return (
     <div className="max-w-4xl mx-auto">
+
+      {/* Header */}
       <div className="flex items-center justify-between mb-6">
         <div>
           <h1 className="text-2xl font-bold text-slate-800">Stock</h1>
           <p className="text-sm text-slate-500">{stock.length} products tracked</p>
         </div>
-        <button onClick={() => { setShowModal(true); setError('') }}
+        <button onClick={() => { setShowModal(true); setError(''); setShowNewProduct(false); setNewProduct(emptyNewProduct) }}
           className="flex items-center gap-2 bg-sky-500 hover:bg-sky-600 text-white px-4 py-2.5 rounded-xl font-medium transition-colors">
           <Plus size={18} /> Manual Adjustment
         </button>
@@ -138,8 +166,6 @@ export default function Stock() {
         <p>🤝 <strong>Reseller transfers</strong> managed from the Reseller page</p>
         <p>⚙️ <strong>Use "Manual Adjustment"</strong> only for corrections, damaged, gifted, lost items</p>
       </div>
-
-
 
       {/* Alerts */}
       {lowStock.length > 0 && (
@@ -155,10 +181,12 @@ export default function Stock() {
         </div>
       )}
 
+      {/* Search */}
       <input value={search} onChange={e => setSearch(e.target.value)}
         placeholder="Search products..."
         className="w-full border border-slate-200 rounded-xl px-4 py-2.5 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-sky-300 mb-5" />
 
+      {/* Stock list */}
       {loading ? (
         <div className="text-center py-20 text-slate-400">Loading...</div>
       ) : filtered.length === 0 ? (
@@ -189,9 +217,13 @@ export default function Stock() {
 
                 <div className="grid grid-cols-3 gap-3 mb-3">
                   <div className={`rounded-xl p-3 text-center
-                    ${s.quantity_available === 0 ? 'bg-red-50 border border-red-200' :
-                      isLow ? 'bg-amber-50 border border-amber-200' : 'bg-emerald-50'}`}>
-                    <p className={`text-xl font-bold ${s.quantity_available === 0 ? 'text-red-500' : isLow ? 'text-amber-600' : 'text-emerald-600'}`}>
+                    ${s.quantity_available === 0
+                      ? 'bg-red-50 border border-red-200'
+                      : isLow
+                        ? 'bg-amber-50 border border-amber-200'
+                        : 'bg-emerald-50'}`}>
+                    <p className={`text-xl font-bold
+                      ${s.quantity_available === 0 ? 'text-red-500' : isLow ? 'text-amber-600' : 'text-emerald-600'}`}>
                       {s.quantity_available}
                     </p>
                     <p className="text-xs text-slate-500">Available</p>
@@ -225,7 +257,9 @@ export default function Stock() {
                 {/* Movement history */}
                 {showHistory === s.id && (
                   <div className="mt-3 pt-3 border-t border-slate-100">
-                    <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">Movement History</p>
+                    <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">
+                      Movement History
+                    </p>
                     {productMovements(s.product_id).length === 0 ? (
                       <p className="text-xs text-slate-400">No movements yet</p>
                     ) : (
@@ -234,11 +268,14 @@ export default function Stock() {
                           const t = movTypeInfo(m.type)
                           const isPos = m.is_positive !== false && t.sign > 0
                           return (
-                            <div key={m.id} className="flex items-center justify-between text-xs py-1 border-b border-slate-50 last:border-0">
+                            <div key={m.id}
+                              className="flex items-center justify-between text-xs py-1 border-b border-slate-50 last:border-0">
                               <div className="flex items-center gap-2">
                                 <span>{t.emoji}</span>
                                 <span className="text-slate-600">{t.label}</span>
-                                {m.notes && <span className="text-slate-400 italic truncate max-w-24">· {m.notes}</span>}
+                                {m.notes && (
+                                  <span className="text-slate-400 italic truncate max-w-24">· {m.notes}</span>
+                                )}
                               </div>
                               <div className="flex items-center gap-2 flex-shrink-0">
                                 <span className={`font-bold ${isPos ? 'text-emerald-600' : 'text-red-500'}`}>
@@ -259,27 +296,80 @@ export default function Stock() {
         </div>
       )}
 
-      {/* Manual Adjustment Modal */}
+      {/* ═══ MANUAL ADJUSTMENT MODAL ═══ */}
       {showModal && (
         <div className="fixed inset-0 bg-black/40 z-50 flex items-end sm:items-center justify-center p-0 sm:p-4">
-          <div className="bg-white w-full sm:max-w-md rounded-t-3xl sm:rounded-2xl shadow-2xl max-h-[85vh] sm:max-h-[92vh] overflow-y-auto mb-16 sm:mb-0">
+          <div className="bg-white w-full sm:max-w-md rounded-t-3xl sm:rounded-2xl shadow-2xl
+            max-h-[85vh] sm:max-h-[92vh] overflow-y-auto mb-16 sm:mb-0">
+
             <div className="flex items-center justify-between p-5 border-b sticky top-0 bg-white rounded-t-3xl z-10">
               <h2 className="text-lg font-bold text-slate-800">Manual Stock Adjustment</h2>
-              <button onClick={() => { setShowModal(false); setForm(emptyForm); setError('') }}
-                className="p-2 hover:bg-slate-100 rounded-xl"><X size={20} /></button>
+              <button onClick={() => { setShowModal(false); setForm(emptyForm); setError(''); setShowNewProduct(false) }}
+                className="p-2 hover:bg-slate-100 rounded-xl">
+                <X size={20} />
+              </button>
             </div>
+
             <div className="p-5 space-y-4">
 
+              {/* Product selector + inline create */}
               <div>
                 <label className="text-sm font-medium text-slate-700 block mb-1">Product *</label>
-                <select value={form.product_id}
+                <select
+                  value={form.product_id}
                   onChange={e => setForm(f => ({ ...f, product_id: e.target.value }))}
                   className="w-full border border-slate-200 rounded-xl px-3 py-2.5 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-sky-300">
                   <option value="">Select product...</option>
                   {products.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
                 </select>
+
+                <button
+                  type="button"
+                  onClick={() => setShowNewProduct(!showNewProduct)}
+                  className="mt-1.5 text-xs text-sky-500 hover:text-sky-700 flex items-center gap-1">
+                  + Product not listed? Create it quickly
+                </button>
+
+                {showNewProduct && (
+                  <div className="mt-2 bg-sky-50 border border-sky-200 rounded-xl p-3 space-y-2">
+                    <p className="text-xs font-bold text-sky-700">New Product</p>
+                    <input
+                      value={newProduct.name}
+                      onChange={e => setNewProduct(p => ({ ...p, name: e.target.value }))}
+                      placeholder="Product name *"
+                      className="w-full border border-sky-200 rounded-lg px-3 py-2 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-sky-300" />
+                    <div className="grid grid-cols-2 gap-2">
+                      <select
+                        value={newProduct.category}
+                        onChange={e => setNewProduct(p => ({ ...p, category: e.target.value }))}
+                        className="border border-slate-200 rounded-lg px-2 py-2 text-sm bg-white focus:outline-none">
+                        {CATEGORIES.map(c => <option key={c}>{c}</option>)}
+                      </select>
+                      <input
+                        type="number"
+                        value={newProduct.selling_price}
+                        onChange={e => setNewProduct(p => ({ ...p, selling_price: e.target.value }))}
+                        placeholder="Price (TND)"
+                        className="border border-slate-200 rounded-lg px-2 py-2 text-sm focus:outline-none" />
+                    </div>
+                    <div className="flex gap-2">
+                      <button
+                        onClick={() => { setShowNewProduct(false); setNewProduct(emptyNewProduct) }}
+                        className="flex-1 py-1.5 text-xs border border-slate-200 rounded-lg hover:bg-white">
+                        Cancel
+                      </button>
+                      <button
+                        onClick={createProductInline}
+                        disabled={savingProduct || !newProduct.name.trim()}
+                        className="flex-1 py-1.5 text-xs bg-sky-500 text-white rounded-lg hover:bg-sky-600 disabled:opacity-50 font-semibold">
+                        {savingProduct ? 'Creating...' : '+ Create & Select'}
+                      </button>
+                    </div>
+                  </div>
+                )}
               </div>
 
+              {/* Reason */}
               <div>
                 <label className="text-sm font-medium text-slate-700 block mb-2">Reason *</label>
                 <div className="grid grid-cols-1 gap-2">
@@ -287,27 +377,35 @@ export default function Stock() {
                     <button key={t.key}
                       onClick={() => setForm(f => ({ ...f, type: t.key, is_positive: t.sign > 0 }))}
                       className={`flex items-center gap-3 px-3 py-3 rounded-xl border text-left transition-all
-                        ${form.type === t.key ? 'border-sky-400 bg-sky-50 ring-2 ring-sky-200' : 'border-slate-200 bg-white hover:bg-slate-50'}`}>
+                        ${form.type === t.key
+                          ? 'border-sky-400 bg-sky-50 ring-2 ring-sky-200'
+                          : 'border-slate-200 bg-white hover:bg-slate-50'}`}>
                       <span className="text-xl">{t.emoji}</span>
                       <div>
                         <p className={`text-sm font-semibold ${t.color}`}>{t.label}</p>
-                        <p className="text-xs text-slate-400">{t.desc} — {t.sign > 0 ? 'Increases' : 'Decreases'} stock</p>
+                        <p className="text-xs text-slate-400">
+                          {t.desc} — {t.sign > 0 ? 'Increases' : 'Decreases'} stock
+                        </p>
                       </div>
                     </button>
                   ))}
                 </div>
               </div>
 
+              {/* Quantity */}
               <div>
                 <label className="text-sm font-medium text-slate-700 block mb-1">Quantity *</label>
-                <input type="number" min="1" value={form.quantity}
+                <input
+                  type="number" min="1" value={form.quantity}
                   onChange={e => setForm(f => ({ ...f, quantity: e.target.value }))}
                   className="w-full border border-slate-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-sky-300 text-lg font-semibold" />
               </div>
 
+              {/* Notes */}
               <div>
                 <label className="text-sm font-medium text-slate-700 block mb-1">Notes</label>
-                <input value={form.notes}
+                <input
+                  value={form.notes}
                   onChange={e => setForm(f => ({ ...f, notes: e.target.value }))}
                   placeholder="Reason or details..."
                   className="w-full border border-slate-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-sky-300" />
@@ -319,10 +417,15 @@ export default function Stock() {
                 </div>
               )}
             </div>
+
             <div className="p-5 pt-0 flex gap-3">
-              <button onClick={() => { setShowModal(false); setForm(emptyForm); setError('') }}
-                className="flex-1 py-3 border border-slate-200 rounded-xl text-sm font-medium hover:bg-slate-50">Cancel</button>
-              <button onClick={logManualMovement}
+              <button
+                onClick={() => { setShowModal(false); setForm(emptyForm); setError(''); setShowNewProduct(false) }}
+                className="flex-1 py-3 border border-slate-200 rounded-xl text-sm font-medium hover:bg-slate-50">
+                Cancel
+              </button>
+              <button
+                onClick={logManualMovement}
                 disabled={saving || !form.product_id || !form.quantity}
                 className="flex-1 py-3 bg-sky-500 hover:bg-sky-600 disabled:opacity-50 text-white rounded-xl text-sm font-medium">
                 {saving ? 'Saving...' : 'Apply Adjustment'}
