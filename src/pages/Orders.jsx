@@ -52,6 +52,7 @@ const emptyForm = {
     // Backdated entry — only affects created_at, everything else is normal
     isBackdated: false,
     orderDate: '',
+    quantity: 1,
 }
 // Standard orders: no custom_description, product_id required
 const emptyItem = { product_id: '', quantity: 1, unit_price: '' }
@@ -392,6 +393,10 @@ export default function Orders() {
         its.reduce((s, i) => s + ((parseFloat(i.unit_price) || 0) * (parseInt(i.quantity) || 1)), 0)
 
     const orderLabel = o => {
+        if (o.type === 'custom') {
+            const qty = o.order_items?.[0]?.quantity || 1
+            return qty > 1 ? `${qty}x ${o.custom_description}` : o.custom_description
+        }
         if (o.custom_description) return o.custom_description
         const names = (o.order_items || [])
             .map(i => i.products?.name || i.custom_description)
@@ -516,13 +521,14 @@ export default function Orders() {
 
 
     // ─── AUTO-CREATE PRODUCTION (custom orders only) ──────────────
-    async function autoCreateProduction(order) {
+    async function autoCreateProduction(order, customQty) {
+        const qty = customQty || (order.order_items?.[0]?.quantity || 1)
         const description = order.custom_description || 'Custom order'
         await supabase.from('productions').insert([{
             order_id: order.id,
             description,
             product_id: null,
-            quantity: 1,
+            quantity: qty,
             status: 'queued',
             material: 'PLA',
         }])
@@ -762,27 +768,7 @@ export default function Orders() {
 
             if (form.type === 'standard') {
                 finalPrice = calcTotal(validItems) || null
-                const hasProducts = validItems.some(i => i.product_id)
-
-                if (hasProducts) {
-                    // Check availability to decide initial status
-                    let canFulfill = true
-                    for (const item of validItems.filter(i => i.product_id)) {
-                        const qty = parseInt(item.quantity) || 1
-                        const { data: stockRow } = await supabase
-                            .from('stock')
-                            .select('quantity_available')
-                            .eq('product_id', item.product_id)
-                            .maybeSingle()
-                        if ((stockRow?.quantity_available ?? 0) < qty) {
-                            canFulfill = false
-                            break
-                        }
-                    }
-                    initialStatus = canFulfill ? 'ready' : 'waiting_restock'
-                } else {
-                    initialStatus = 'ready'
-                }
+                initialStatus = 'ready' // Default to ready, will be updated to in_production later if items are missing
             }
 
             // Create the order
@@ -822,44 +808,97 @@ export default function Orders() {
                         }))
                     )
                 if (itemsErr) throw itemsErr
+            } else if (form.type === 'custom') {
+                const { error: itemsErr } = await supabase
+                    .from('order_items')
+                    .insert([{
+                        order_id: order.id,
+                        custom_description: form.custom_description || null,
+                        quantity: parseInt(form.quantity) || 1,
+                        unit_price: parseFloat(form.total_price) || null,
+                    }])
+                if (itemsErr) throw itemsErr
             }
 
-            // ── Reduce stock only if order is immediately ready ──────
-            if (form.type === 'standard' && initialStatus === 'ready') {
+            // ── Fulfill stock and Auto-queue missing items ─────────────
+            if (form.type === 'standard' && validItems.length > 0) {
+                let queuedCount = 0
                 for (const item of validItems.filter(i => i.product_id)) {
-                    const qty = parseInt(item.quantity) || 1
+                    const needed = parseInt(item.quantity) || 1
+                    
                     const { data: stockRow } = await supabase
                         .from('stock')
                         .select('id, quantity_available')
                         .eq('product_id', item.product_id)
                         .maybeSingle()
-
-                    if (stockRow && stockRow.quantity_available >= qty) {
+                        
+                    const available = stockRow?.quantity_available || 0
+                    const takingFromStock = Math.min(needed, available)
+                    const missing = needed - takingFromStock
+                    
+                    // 1. Deduct available stock immediately
+                    if (takingFromStock > 0 && stockRow) {
                         await supabase.from('stock').update({
-                            quantity_available: stockRow.quantity_available - qty,
+                            quantity_available: available - takingFromStock,
                             updated_at: new Date().toISOString(),
                         }).eq('id', stockRow.id)
 
                         await supabase.from('stock_movements').insert([{
                             product_id: item.product_id,
                             type: 'sold',
-                            quantity: qty,
+                            quantity: takingFromStock,
                             is_positive: false,
                             order_id: order.id,
-                            notes: `Sold — ${client?.name || ''}`,
+                            notes: `Sold from stock — ${client?.name || ''}`,
                         }])
-                    } else {
-                        // Race condition: stock disappeared — flip to waiting_restock
-                        await supabase.from('orders')
-                            .update({ status: 'waiting_restock' })
-                            .eq('id', order.id)
                     }
+                    
+                    // 2. Queue missing items
+                    if (missing > 0) {
+                        const productRecord = products.find(p => p.id === item.product_id)
+                        const productName = productRecord?.name || 'Unknown'
+                        
+                        const { data: assemblies } = await supabase
+                            .from('product_assemblies')
+                            .select('child_product_id, quantity, products!child_product_id(name)')
+                            .eq('parent_product_id', item.product_id)
+                            
+                        if (assemblies && assemblies.length > 0) {
+                            const payload = assemblies.map(a => ({
+                                order_id: order.id,
+                                product_id: a.child_product_id,
+                                description: `[Part of ${productName}] ${a.products?.name || ''}`,
+                                quantity: missing * (a.quantity || 1),
+                                status: 'queued',
+                                material: 'PLA'
+                            }))
+                            await supabase.from('productions').insert(payload)
+                            queuedCount += assemblies.length
+                        } else {
+                            await supabase.from('productions').insert([{
+                                order_id: order.id,
+                                product_id: item.product_id,
+                                description: productName,
+                                quantity: missing,
+                                status: 'queued',
+                                material: 'PLA'
+                            }])
+                            queuedCount++
+                        }
+                    }
+                }
+                
+                // If anything was queued, ensure order tracks it via 'in_production'
+                if (queuedCount > 0) {
+                    await supabase.from('orders')
+                        .update({ status: 'in_production' })
+                        .eq('id', order.id)
                 }
             }
 
             // ── Auto-create production for custom orders ─────────────
             if (form.type === 'custom') {
-                await autoCreateProduction(order)
+                await autoCreateProduction(order, parseInt(form.quantity) || 1)
             }
 
             closeModal()
@@ -1108,6 +1147,80 @@ export default function Orders() {
         } catch (err) {
             console.error('Status change error:', err)
             setError(err.message || 'Failed to update status. Please try again.')
+        } finally {
+            setSaving(false)
+        }
+    }
+
+    // ─── QUEUE MISSING PRODUCTIONS (Assemblies & Standard) ────────
+    async function queueMissingProductions() {
+        if (!selected) return
+        setSaving(true)
+        setError('')
+        try {
+            // 1. Fetch order items
+            const { data: rawItems } = await supabase
+                .from('order_items')
+                .select('product_id, quantity, products(name)')
+                .eq('order_id', selected.id)
+
+            const productItems = (rawItems || []).filter(i => i.product_id)
+            let queuedCount = 0
+
+            for (const item of productItems) {
+                const needed = parseInt(item.quantity) || 1
+
+                const { data: stockRow } = await supabase
+                    .from('stock')
+                    .select('quantity_available')
+                    .eq('product_id', item.product_id)
+                    .maybeSingle()
+
+                const available = stockRow?.quantity_available || 0
+                const missing = Math.max(0, needed - available)
+
+                if (missing > 0) {
+                    // Check if it's an assembly
+                    const { data: assemblies } = await supabase
+                        .from('product_assemblies')
+                        .select('child_product_id, quantity, products!child_product_id(name)')
+                        .eq('parent_product_id', item.product_id)
+
+                    if (assemblies && assemblies.length > 0) {
+                        // Queue the parts
+                        const payload = assemblies.map(a => ({
+                            order_id: selected.id,
+                            product_id: a.child_product_id,
+                            description: `[Part of ${item.products?.name}] ${a.products?.name || ''}`,
+                            quantity: missing * (a.quantity || 1),
+                            status: 'queued',
+                            material: 'PLA'
+                        }))
+                        await supabase.from('productions').insert(payload)
+                        queuedCount += assemblies.length
+                    } else {
+                        // Queue the product itself
+                        await supabase.from('productions').insert([{
+                            order_id: selected.id,
+                            product_id: item.product_id,
+                            description: item.products?.name || 'Production job',
+                            quantity: missing,
+                            status: 'queued',
+                            material: 'PLA'
+                        }])
+                        queuedCount++
+                    }
+                }
+            }
+
+            if (queuedCount > 0) {
+                await applyStatusChange(selected, 'in_production')
+            } else {
+                setError('Everything is already in stock. Please click "Mark as Ready".')
+            }
+        } catch (err) {
+            console.error('Queue productions error:', err)
+            setError(err.message || 'Failed to queue productions.')
         } finally {
             setSaving(false)
         }
@@ -1643,14 +1756,28 @@ export default function Orders() {
                                         </p>
                                     </div>
 
-                                    {/* Dimensions */}
-                                    <div>
-                                        <label className="text-sm font-medium text-slate-700 block mb-1.5">Dimensions</label>
-                                        <input
-                                            value={form.dimensions}
-                                            onChange={e => setForm(f => ({ ...f, dimensions: e.target.value }))}
-                                            placeholder="e.g. 10×5×3 cm"
-                                            className="w-full border border-slate-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-sky-300" />
+                                    {/* Quantity and Dimensions in same row */}
+                                    <div className="grid grid-cols-2 gap-3">
+                                        {/* Quantity */}
+                                        <div>
+                                            <label className="text-sm font-medium text-slate-700 block mb-1.5">Quantity</label>
+                                            <input
+                                                type="number"
+                                                min="1"
+                                                value={form.quantity}
+                                                onChange={e => setForm(f => ({ ...f, quantity: e.target.value }))}
+                                                className="w-full border-2 border-slate-200 focus:border-sky-400 rounded-xl px-3 py-2.5 text-sm focus:outline-none transition-colors" />
+                                        </div>
+
+                                        {/* Dimensions */}
+                                        <div>
+                                            <label className="text-sm font-medium text-slate-700 block mb-1.5">Dimensions</label>
+                                            <input
+                                                value={form.dimensions}
+                                                onChange={e => setForm(f => ({ ...f, dimensions: e.target.value }))}
+                                                placeholder="e.g. 10×5×3 cm"
+                                                className="w-full border border-slate-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-sky-300" />
+                                        </div>
                                     </div>
 
                                     {/* Price */}
@@ -1970,6 +2097,13 @@ export default function Orders() {
                                                 </button>
                                             </div>
                                         )}
+
+                                        <button
+                                            onClick={queueMissingProductions}
+                                            disabled={saving}
+                                            className="w-full py-3 mb-2 bg-violet-500 hover:bg-violet-600 text-white rounded-xl font-bold text-sm disabled:opacity-50 transition-colors flex items-center justify-center gap-2">
+                                            🖨️ Queue Prints for Missing Items
+                                        </button>
 
                                         <button
                                             onClick={fulfillRestockedOrder}

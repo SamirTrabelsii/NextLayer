@@ -5,7 +5,7 @@ import { useSettings } from '../lib/SettingsContext'
 import ImageUpload from '../components/ImageUpload'
 import StlUpload from '../components/StlUpload'
 
-const CATEGORIES = ['All', 'Keychains', 'Clickers', 'Decorations', 'Custom Orders']
+const CATEGORIES = ['All', 'Keychains', 'Clickers', 'Decorations', 'Parts', 'Custom Orders']
 const MATERIALS = ['PLA', 'PETG', 'ABS', 'TPU', 'Resin', 'Other']
 
 const empty = {
@@ -28,6 +28,11 @@ export default function Products() {
     const [materials, setMaterials] = useState([])
     const [productMaterials, setProductMaterials] = useState([]) // BOM for current product
     const [bomItem, setBomItem] = useState({ material_id: '', quantity_per_unit: 1 })
+    
+    const [productAssemblies, setProductAssemblies] = useState([]) // Parts for composite product
+    const [assemblyItem, setAssemblyItem] = useState({ child_product_id: '', quantity: 1 })
+    
+    const [multiplier, setMultiplier] = useState('')
 
     const { settings } = useSettings()
 
@@ -70,6 +75,14 @@ export default function Products() {
             .select('*, materials(name, unit, cost_per_unit)')
             .eq('product_id', p.id)
         setProductMaterials(bom || [])
+
+        // Load existing Assemblies (parts)
+        const { data: assem } = await supabase
+            .from('product_assemblies')
+            .select('*')
+            .eq('parent_product_id', p.id)
+        setProductAssemblies(assem || [])
+
         setShowModal(true)
         loadProductionHistory(p.id)
     }
@@ -78,6 +91,7 @@ export default function Products() {
         setForm(empty)
         setEditing(null)
         setProductMaterials([])
+        setProductAssemblies([])
         setShowModal(true)
     }
 
@@ -85,27 +99,59 @@ export default function Products() {
         setShowModal(false)
         setForm(empty)
         setEditing(null)
+        setMultiplier('')
     }
 
     // Moved inside component so it can access settings from context
-    function calcProductCost(formData, bom) {
+    function calcProductCost(formData, bom, assemblies = []) {
         const grams = parseFloat(formData.filament_grams) || 0
         const hours = parseFloat(formData.print_time_hours) || 0
         const filamentCost = (grams / 1000) * (settings.filament_price_per_kg ?? 35)
         const electricityCost = hours * (settings.electricity_per_hour ?? 0.15)
         const materialsCost = bom.reduce((s, b) =>
             s + ((b.quantity_per_unit || 1) * (b.materials?.cost_per_unit || 0)), 0)
-        return (filamentCost + electricityCost + materialsCost).toFixed(2)
+            
+        // Calculate cost of child parts
+        const assemblyCost = assemblies.reduce((s, a) => {
+             const child = products.find(p => p.id === a.child_product_id)
+             return s + ((a.quantity || 1) * (parseFloat(child?.production_cost) || 0))
+        }, 0)
+        
+        return (filamentCost + electricityCost + materialsCost + assemblyCost).toFixed(2)
+    }
+
+    // Helper to update both cost and price if a multiplier is active
+    function updateFormCostAndPrice(f, bom, assemblies) {
+        const cost = calcProductCost(f, bom, assemblies)
+        f.production_cost = cost
+        if (multiplier && !isNaN(parseFloat(multiplier))) {
+            // "arrondi" -> round to nearest integer
+            f.selling_price = Math.round(parseFloat(cost) * parseFloat(multiplier)).toFixed(2)
+        }
+        return f
     }
 
     // Auto-calculate production cost when filament or time changes
     function handleChange(e) {
         const { name, value, type, checked } = e.target
-        const updated = { ...form, [name]: type === 'checkbox' ? checked : value }
+        let updated = { ...form, [name]: type === 'checkbox' ? checked : value }
         if (['filament_grams', 'print_time_hours'].includes(name)) {
-            updated.production_cost = calcProductCost(updated, productMaterials)
+            updated = updateFormCostAndPrice(updated, productMaterials, productAssemblies)
         }
         setForm(updated)
+    }
+
+    function handleMultiplierChange(e) {
+        const val = e.target.value
+        setMultiplier(val)
+        if (val && form.production_cost) {
+            const m = parseFloat(val)
+            const c = parseFloat(form.production_cost)
+            if (!isNaN(m) && !isNaN(c)) {
+                const price = Math.round(c * m)
+                setForm(f => ({ ...f, selling_price: price.toFixed(2) }))
+            }
+        }
     }
 
     async function addBomItem() {
@@ -119,13 +165,27 @@ export default function Products() {
         const newBom = [...productMaterials, newItem]
         setProductMaterials(newBom)
         setBomItem({ material_id: '', quantity_per_unit: 1 })
-        setForm(f => ({ ...f, production_cost: calcProductCost(f, newBom) }))
+        setForm(f => updateFormCostAndPrice({ ...f }, newBom, productAssemblies))
     }
 
     function removeBomItem(idx) {
         const newBom = productMaterials.filter((_, i) => i !== idx)
         setProductMaterials(newBom)
-        setForm(f => ({ ...f, production_cost: calcProductCost(f, newBom) }))
+        setForm(f => updateFormCostAndPrice({ ...f }, newBom, productAssemblies))
+    }
+
+    async function addAssemblyItem() {
+        if (!assemblyItem.child_product_id) return
+        const newAssem = [...productAssemblies, assemblyItem]
+        setProductAssemblies(newAssem)
+        setAssemblyItem({ child_product_id: '', quantity: 1 })
+        setForm(f => updateFormCostAndPrice({ ...f }, productMaterials, newAssem))
+    }
+
+    function removeAssemblyItem(idx) {
+        const newAssem = productAssemblies.filter((_, i) => i !== idx)
+        setProductAssemblies(newAssem)
+        setForm(f => updateFormCostAndPrice({ ...f }, productMaterials, newAssem))
     }
 
     async function saveProduct() {
@@ -146,7 +206,7 @@ export default function Products() {
             productId = data?.id
         }
 
-        // Save BOM
+        // Save BOM and Assemblies
         if (productId) {
             await supabase.from('product_materials').delete().eq('product_id', productId)
             if (productMaterials.length > 0) {
@@ -157,6 +217,22 @@ export default function Products() {
                         quantity_per_unit: b.quantity_per_unit,
                     }))
                 )
+            }
+            
+            // Try to save assemblies. If it fails (table doesn't exist yet), catch it so we don't crash the save
+            try {
+                await supabase.from('product_assemblies').delete().eq('parent_product_id', productId)
+                if (productAssemblies.length > 0) {
+                    await supabase.from('product_assemblies').insert(
+                        productAssemblies.map(a => ({
+                            parent_product_id: productId,
+                            child_product_id: a.child_product_id,
+                            quantity: a.quantity,
+                        }))
+                    )
+                }
+            } catch (err) {
+                console.warn('Failed to save assemblies, table may not exist yet:', err)
             }
         }
 
@@ -387,18 +463,26 @@ export default function Products() {
                             </div>
 
                             {/* Cost + Price */}
-                            <div className="grid grid-cols-2 gap-3">
+                            <div className="grid grid-cols-3 gap-3">
                                 <div>
                                     <label className="text-sm font-medium text-slate-700 block mb-1">
-                                        Production Cost (TND)
-                                        <span className="text-xs text-sky-500 ml-1">auto-calculated</span>
+                                        Production Cost
+                                        <span className="text-xs text-sky-500 ml-1">auto</span>
                                     </label>
                                     <input name="production_cost" type="number" value={form.production_cost} onChange={handleChange}
                                         placeholder="0.00"
                                         className="w-full border border-slate-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-sky-300 bg-sky-50" />
                                 </div>
                                 <div>
-                                    <label className="text-sm font-medium text-slate-700 block mb-1">Selling Price (TND)</label>
+                                    <label className="text-sm font-medium text-slate-700 block mb-1 text-center">
+                                        Multiplier (x)
+                                    </label>
+                                    <input type="number" step="0.1" value={multiplier} onChange={handleMultiplierChange}
+                                        placeholder="e.g. 2.0"
+                                        className="w-full border border-slate-200 rounded-xl px-3 py-2.5 text-sm text-center font-medium focus:outline-none focus:ring-2 focus:ring-emerald-300 bg-emerald-50 text-emerald-700" />
+                                </div>
+                                <div>
+                                    <label className="text-sm font-medium text-slate-700 block mb-1">Selling Price</label>
                                     <input name="selling_price" type="number" value={form.selling_price} onChange={handleChange}
                                         placeholder="0.00"
                                         className="w-full border border-slate-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-sky-300" />
@@ -458,6 +542,68 @@ export default function Products() {
                                     <button onClick={addBomItem} disabled={!bomItem.material_id}
                                         className="px-3 py-2 bg-sky-500 hover:bg-sky-600 disabled:opacity-40 text-white rounded-xl text-sm font-medium">
                                         Add
+                                    </button>
+                                </div>
+                            </div>
+                            
+                            {/* Assemblies (Parts) */}
+                            <div>
+                                <label className="text-sm font-medium text-slate-700 block mb-2">
+                                    🧩 Sub-Parts (Composite Product)
+                                    <span className="text-xs text-slate-400 font-normal ml-1">
+                                        — other products required to build this one
+                                    </span>
+                                </label>
+
+                                {productAssemblies.length > 0 && (
+                                    <div className="mb-2 space-y-1.5">
+                                        {productAssemblies.map((a, idx) => {
+                                            const child = products.find(p => p.id === a.child_product_id)
+                                            return (
+                                                <div key={idx} className="flex items-center justify-between bg-violet-50 rounded-xl px-3 py-2 border border-violet-100">
+                                                    <div className="flex items-center gap-2">
+                                                        <span className="text-sm font-medium text-violet-700">{child?.name || 'Unknown part'}</span>
+                                                        <span className="text-xs text-violet-400">× {a.quantity}</span>
+                                                    </div>
+                                                    <div className="flex items-center gap-2">
+                                                        {child?.production_cost > 0 && (
+                                                            <span className="text-xs text-violet-600 font-medium">
+                                                                {(a.quantity * child.production_cost).toFixed(2)} TND
+                                                            </span>
+                                                        )}
+                                                        <button onClick={() => removeAssemblyItem(idx)}
+                                                            className="p-1 text-red-400 hover:text-red-600">
+                                                            <X size={14} />
+                                                        </button>
+                                                    </div>
+                                                </div>
+                                            )
+                                        })}
+                                        <div className="text-xs text-right text-slate-500 pr-2">
+                                            Parts total: {productAssemblies.reduce((s, a) => {
+                                                const child = products.find(p => p.id === a.child_product_id)
+                                                return s + ((a.quantity || 1) * (parseFloat(child?.production_cost) || 0))
+                                            }, 0).toFixed(2)} TND
+                                        </div>
+                                    </div>
+                                )}
+
+                                <div className="flex gap-2">
+                                    <select value={assemblyItem.child_product_id}
+                                        onChange={e => setAssemblyItem(f => ({ ...f, child_product_id: e.target.value }))}
+                                        className="flex-1 border border-slate-200 rounded-xl px-3 py-2 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-sky-300">
+                                        <option value="">Add a part...</option>
+                                        {products.filter(p => p.id !== editing && !productAssemblies.find(a => a.child_product_id === p.id)).map(p => (
+                                            <option key={p.id} value={p.id}>{p.name}</option>
+                                        ))}
+                                    </select>
+                                    <input type="number" min="1" value={assemblyItem.quantity}
+                                        onChange={e => setAssemblyItem(f => ({ ...f, quantity: e.target.value }))}
+                                        className="w-16 border border-slate-200 rounded-xl px-2 py-2 text-sm text-center focus:outline-none focus:ring-2 focus:ring-sky-300"
+                                        placeholder="Qty" />
+                                    <button onClick={addAssemblyItem} disabled={!assemblyItem.child_product_id}
+                                        className="px-3 py-2 bg-violet-500 hover:bg-violet-600 disabled:opacity-40 text-white rounded-xl text-sm font-medium">
+                                        Add Part
                                     </button>
                                 </div>
                             </div>

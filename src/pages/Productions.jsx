@@ -237,6 +237,40 @@ export default function Productions() {
         }
     }
 
+    // ─── RECALCULATE PRODUCT COST (Cascading) ─────────────────────
+    async function recalculateProductCost(productId) {
+        try {
+            const [
+                { data: product },
+                { data: materials },
+                { data: assemblies }
+            ] = await Promise.all([
+                supabase.from('products').select('*').eq('id', productId).single(),
+                supabase.from('product_materials').select('*, materials(cost_per_unit)').eq('product_id', productId),
+                supabase.from('product_assemblies').select('quantity, products!child_product_id(production_cost)').eq('parent_product_id', productId)
+            ])
+
+            if (!product) return
+
+            const grams = parseFloat(product.filament_grams) || 0
+            const hours = parseFloat(product.print_time_hours) || 0
+            const filamentCost = (grams / 1000) * (settings.filament_price_per_kg ?? 35)
+            const electricityCost = hours * (settings.electricity_per_hour ?? 0.15)
+            
+            const materialsCost = (materials || []).reduce((s, b) =>
+                s + ((b.quantity_per_unit || 1) * (parseFloat(b.materials?.cost_per_unit) || 0)), 0)
+                
+            const assemblyCost = (assemblies || []).reduce((s, a) =>
+                s + ((a.quantity || 1) * (parseFloat(a.products?.production_cost) || 0)), 0)
+                
+            const totalCost = parseFloat((filamentCost + electricityCost + materialsCost + assemblyCost).toFixed(2))
+
+            await supabase.from('products').update({ production_cost: totalCost }).eq('id', productId)
+        } catch (err) {
+            console.error('Failed to recalculate cost for product', productId, err)
+        }
+    }
+
     // ─── ADVANCE TO NEXT STATUS ──────────────────────────────────
     async function advanceProduction(prod) {
         const next = getNext(prod.status)
@@ -296,6 +330,18 @@ export default function Productions() {
                     await supabase.from('products')
                         .update({ production_cost: prod.actual_cost })
                         .eq('id', prod.product_id)
+                        
+                    // ALSO update any parent products that use this product as an assembly
+                    const { data: parentLinks } = await supabase
+                        .from('product_assemblies')
+                        .select('parent_product_id')
+                        .eq('child_product_id', prod.product_id)
+                        
+                    if (parentLinks && parentLinks.length > 0) {
+                        for (const link of parentLinks) {
+                            await recalculateProductCost(link.parent_product_id)
+                        }
+                    }
                 }
 
                 // ── Deduct from filament spools when Done ─────────────────
