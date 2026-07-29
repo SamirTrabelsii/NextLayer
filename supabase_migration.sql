@@ -56,3 +56,25 @@ CREATE POLICY "Allow anon delete access"
 ON public.product_assemblies FOR DELETE 
 TO anon 
 USING (true);
+
+-- 5. Add product_type column to products
+-- Values: 'sellable' (for orders), 'component' (child parts only), 'both'
+ALTER TABLE public.products ADD COLUMN IF NOT EXISTS product_type TEXT DEFAULT 'sellable';
+
+-- 6. Add custom product fields & composite tracking to order_items and productions
+ALTER TABLE public.order_items ADD COLUMN IF NOT EXISTS dimensions TEXT;
+ALTER TABLE public.order_items ADD COLUMN IF NOT EXISTS reference_notes TEXT;
+ALTER TABLE public.order_items ADD COLUMN IF NOT EXISTS reference_image_url TEXT;
+ALTER TABLE public.order_items ADD COLUMN IF NOT EXISTS stl_url TEXT;
+ALTER TABLE public.order_items ADD COLUMN IF NOT EXISTS is_composite BOOLEAN DEFAULT false;
+
+ALTER TABLE public.productions ADD COLUMN IF NOT EXISTS is_composite BOOLEAN DEFAULT false;
+
+-- 7. Add fulfilled_quantity for manual standard stock management
+ALTER TABLE public.order_items ADD COLUMN IF NOT EXISTS fulfilled_quantity INTEGER DEFAULT 0;
+
+-- 8. Link productions to specific order items (for UI grouping)
+ALTER TABLE public.productions ADD COLUMN IF NOT EXISTS order_item_id UUID REFERENCES public.order_items(id) ON DELETE CASCADE;
+
+-- 9. Reload PostgREST schema cache so the API can see the new columns instantly
+NOTIFY pgrst, 'reload schema';

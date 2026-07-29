@@ -2,7 +2,8 @@ import { useState, useEffect, useCallback } from 'react'
 import { supabase } from '../lib/supabase'
 import {
     Plus, X, Search, ChevronRight, Trash2,
-    ArrowRight, Phone, UserPlus, PackagePlus, AlertTriangle, Box, Download
+    ArrowRight, Phone, UserPlus, PackagePlus, AlertTriangle, Box, Download,
+    Puzzle, Image, AlertCircle, Printer
 } from 'lucide-react'
 import ImageUpload from '../components/ImageUpload'
 import StlUpload from '../components/StlUpload'
@@ -45,7 +46,7 @@ const getNextStatus = (order) => {
 
 // ─── EMPTY FORMS ──────────────────────────────────────────────
 const emptyForm = {
-    type: 'custom', client_id: '', custom_description: '',
+    client_id: '', custom_description: '',
     dimensions: '', reference_notes: '', deadline: '',
     total_price: '', notes: '', status: 'new',
     reference_image_url: '', stl_url: '',
@@ -54,8 +55,19 @@ const emptyForm = {
     orderDate: '',
     quantity: 1,
 }
-// Standard orders: no custom_description, product_id required
-const emptyItem = { product_id: '', quantity: 1, unit_price: '' }
+// Unified item shape — supports both catalogue and custom products
+const emptyItem = {
+    is_custom: false,
+    product_id: '',
+    custom_description: '',
+    quantity: 1,
+    unit_price: '',
+    dimensions: '',
+    reference_notes: '',
+    reference_image_url: '',
+    stl_url: '',
+    is_composite: false,
+}
 const emptyClient = { name: '', phone: '', email: '' }
 const emptyProduct = { name: '', category: 'Custom Orders', selling_price: '', production_cost: '' }
 const CATEGORIES = ['Keychains', 'Clickers', 'Decorations', 'Custom Orders']
@@ -119,7 +131,24 @@ export default function Orders() {
     const [paidDateOverride, setPaidDateOverride] = useState('')
     const [confirmingPaidDate, setConfirmingPaidDate] = useState(false)
 
+    // Custom Job Configurator Modal — intercepts the → In Production transition
+    const [showJobConfigModal, setShowJobConfigModal] = useState(false)
+    const [pendingCustomItems, setPendingCustomItems] = useState([])
+    const [currentConfigItemIndex, setCurrentConfigItemIndex] = useState(0)
+    const [isItemComposite, setIsItemComposite] = useState(false)
+    const [compositeParts, setCompositeParts] = useState([{ name: '', quantity: 1 }])
+    const [splitting, setSplitting] = useState(false)
+    const [targetConfigOrder, setTargetConfigOrder] = useState(null)
+
     const [showOrderImport3mf, setShowOrderImport3mf] = useState(false)
+
+    // Job Advance Modal (from order detail & kanban ready flow)
+    const [showJobAdvanceModal, setShowJobAdvanceModal] = useState(false)
+    const [advanceJobsBatch, setAdvanceJobsBatch] = useState([])
+    const [jobAdvanceForms, setJobAdvanceForms] = useState({})
+    const [active3mfJobId, setActive3mfJobId] = useState(null)
+    const [advancingJob, setAdvancingJob] = useState(null)
+    const [advanceBatchOrder, setAdvanceBatchOrder] = useState(null)
     const { settings } = useSettings()
 
     async function fetchOrderFinancials(order) {
@@ -360,10 +389,11 @@ export default function Orders() {
           id, type, status, total_price, is_paid, paid_at, deadline, notes,
           custom_description, dimensions, reference_notes, reference_image_url, stl_url, created_at,
           clients(id, name, phone),
-          order_items(id, quantity, unit_price, custom_description, product_id, products(id, name))
+          order_items(id, quantity, unit_price, custom_description, product_id, dimensions, reference_notes, reference_image_url, stl_url, is_composite, fulfilled_quantity, products(id, name, product_type)),
+          productions(id, status, description, product_id, is_composite, order_item_id)
         `).order('created_at', { ascending: false }),
                 supabase.from('clients').select('id, name, phone').order('name'),
-                supabase.from('products').select('id, name, selling_price, category').eq('is_active', true).order('name'),
+                supabase.from('products').select('id, name, selling_price, category, product_type').eq('is_active', true).order('name'),
             ])
             if (e1) throw e1
             setOrders(o ?? [])
@@ -670,6 +700,34 @@ export default function Orders() {
         setShowOrderImport3mf(false)
     }
 
+    function handleAdvanceJobImport3mf(data) {
+        if (!active3mfJobId) return
+        
+        const { filament_grams, support_grams, print_time_hours, filament_data, _filament_cost } = data
+
+        // Calculate full cost: filament (from spool/rate) + electricity + machine wear
+        const hours = parseFloat(print_time_hours) || 0
+        const elecCost = hours * (settings.electricity_per_hour || 0.15)
+        const machineRate = settings.machine_cost > 0 && settings.machine_lifespan_hours > 0
+            ? settings.machine_cost / settings.machine_lifespan_hours : 0
+        const nozzleRate = settings.nozzle_cost > 0 && settings.nozzle_lifespan_hours > 0
+            ? settings.nozzle_cost / settings.nozzle_lifespan_hours : 0
+        const wearCost = hours * (machineRate + nozzleRate)
+        const totalCost = parseFloat(((_filament_cost || 0) + elecCost + wearCost).toFixed(3))
+
+        setJobAdvanceForms(prev => ({
+            ...prev,
+            [active3mfJobId]: {
+                ...prev[active3mfJobId],
+                filament_grams: filament_grams ? String(filament_grams) : prev[active3mfJobId]?.filament_grams,
+                print_time_hours: print_time_hours ? String(print_time_hours) : prev[active3mfJobId]?.print_time_hours,
+                actual_cost: totalCost ? String(totalCost) : prev[active3mfJobId]?.actual_cost,
+                filament_data: filament_data ?? prev[active3mfJobId]?.filament_data,
+            }
+        }))
+        setActive3mfJobId(null)
+    }
+
     // ── Confirm delivery: consume packaging then advance order ────
     async function confirmDelivery(skipPackaging = false) {
         if (!pendingDelivery) return
@@ -716,11 +774,60 @@ export default function Orders() {
     }
 
     // ── Helper: should this status change trigger packaging modal? ─
-    function handleStatusAdvance(order, targetStatus) {
+    async function handleStatusAdvance(order, targetStatus) {
         if (targetStatus === 'delivered') {
             initDelivery(order)
-        } else if (targetStatus === 'ready' && order.type === 'custom') {
-            initProductionDetails(order)   // intercept for custom orders
+        } else if (targetStatus === 'ready') {
+            // Gate: re-fetch fresh order data to ensure production statuses are current
+            const { data: freshOrder } = await supabase.from('orders').select(`
+                id, type, status,
+                order_items(id, quantity, unit_price, custom_description, product_id, is_composite, fulfilled_quantity),
+                productions(id, status, order_item_id)
+            `).eq('id', order.id).single()
+
+            if (!freshOrder) {
+                setError('Could not fetch order data. Please refresh and try again.')
+                return
+            }
+
+            const customItems = freshOrder.order_items?.filter(i => i.is_custom || i.custom_description) || []
+            const standardItems = freshOrder.order_items?.filter(i => !i.is_custom && !i.custom_description && i.product_id) || []
+
+            // Check standard items: fulfilled_quantity >= quantity
+            const standardReady = standardItems.every(i =>
+                (i.fulfilled_quantity || 0) >= (i.quantity || 1)
+            )
+            if (!standardReady) {
+                setError(`Cannot mark order as Ready:\n• Standard items are not fully stock-fulfilled.`)
+                return
+            }
+
+            // Find unfinished custom jobs
+            const unfinishedJobs = [];
+            customItems.forEach(item => {
+                const linkedJobs = freshOrder.productions?.filter(p => p.order_item_id === item.id) || []
+                unfinishedJobs.push(...linkedJobs.filter(j => j.status !== 'done'))
+            })
+
+            if (unfinishedJobs.length > 0) {
+                const forms = {}
+                unfinishedJobs.forEach(job => {
+                    forms[job.id] = {
+                        filament_grams: job.filament_grams || '',
+                        print_time_hours: job.print_time_hours || '',
+                        actual_cost: job.actual_cost || '',
+                        notes: job.notes || '',
+                        filament_data: job.filament_data || null,
+                    }
+                })
+                setAdvanceBatchOrder(order)
+                setAdvanceJobsBatch(unfinishedJobs)
+                setJobAdvanceForms(forms)
+                setShowJobAdvanceModal(true)
+                return
+            }
+
+            applyStatusChange(order, 'ready')
         } else if (targetStatus === 'paid') {
             // Ask "when was this paid?" — pre-fill with the order's own creation date
             const orderDay = order.created_at
@@ -729,8 +836,91 @@ export default function Orders() {
             setPaidDateOverride(orderDay)
             setPendingPaidOrder(order)
             setShowPaidDateModal(true)
+        } else if (targetStatus === 'in_production') {
+            // New Flow: generate production jobs at this step!
+            // Find all custom items that do NOT have a production job yet.
+            const customItemsToConfig = order.order_items?.filter(item => 
+                (item.is_custom || item.custom_description) && 
+                !order.productions?.some(p => p.order_item_id === item.id)
+            ) || []
+            
+            if (customItemsToConfig.length > 0) {
+                setTargetConfigOrder(order)
+                setPendingCustomItems(customItemsToConfig)
+                setCurrentConfigItemIndex(0)
+                setIsItemComposite(customItemsToConfig[0].is_composite || false)
+                setCompositeParts([{ name: '', quantity: 1 }])
+                setShowJobConfigModal(true)
+            } else {
+                applyStatusChange(order, targetStatus)
+            }
         } else {
             applyStatusChange(order, targetStatus)
+        }
+    }
+
+    // ── Generate Custom Production Jobs ──
+    async function confirmJobConfig() {
+        if (!pendingCustomItems || pendingCustomItems.length === 0) return
+        
+        const currentItem = pendingCustomItems[currentConfigItemIndex]
+        setSplitting(true)
+        setError('')
+
+        try {
+            let newJobs = []
+            if (isItemComposite) {
+                const validParts = compositeParts.filter(p => p.name.trim() && p.quantity > 0)
+                if (validParts.length === 0) {
+                    setError('Please add at least one valid part.')
+                    setSplitting(false)
+                    return
+                }
+                newJobs = validParts.map(part => ({
+                    order_id: targetConfigOrder.id,
+                    order_item_id: currentItem.id,
+                    product_id: currentItem.product_id,
+                    description: `[Part of ${currentItem.custom_description || 'Custom Item'}] ${part.name.trim()}`,
+                    quantity: (currentItem.quantity || 1) * (parseInt(part.quantity) || 1),
+                    status: 'queued',
+                    material: 'PLA',
+                    is_composite: false
+                }))
+            } else {
+                newJobs = [{
+                    order_id: targetConfigOrder.id,
+                    order_item_id: currentItem.id,
+                    product_id: currentItem.product_id,
+                    description: currentItem.custom_description || 'Custom Item',
+                    quantity: currentItem.quantity || 1,
+                    status: 'queued',
+                    material: 'PLA',
+                    is_composite: false
+                }]
+            }
+
+            const { error: insertErr } = await supabase.from('productions').insert(newJobs)
+            if (insertErr) throw insertErr
+
+            // Move to next item or finish
+            if (currentConfigItemIndex + 1 < pendingCustomItems.length) {
+                const nextItem = pendingCustomItems[currentConfigItemIndex + 1]
+                setCurrentConfigItemIndex(currentConfigItemIndex + 1)
+                setIsItemComposite(nextItem.is_composite || false)
+                setCompositeParts([{ name: '', quantity: 1 }])
+            } else {
+                setShowJobConfigModal(false)
+                setPendingCustomItems([])
+                const orderToAdvance = targetConfigOrder
+                setTargetConfigOrder(null)
+                await applyStatusChange(orderToAdvance, 'in_production')
+            }
+            await fetchAll()
+        } catch (err) {
+            console.error('Error generating jobs:', err)
+            setError('Failed to configure production jobs.')
+        } finally {
+            setSplitting(false)
         }
     }
 
@@ -750,7 +940,33 @@ export default function Orders() {
         }
     }
     // ─── SAVE ORDER ───────────────────────────────────────────────
-    async function saveOrder() {
+    
+    async function createProductInline(idx) {
+        if (!newProduct.name.trim() || !newProduct.selling_price) return
+        setSavingInline(true)
+        try {
+            const payload = {
+                name: newProduct.name.trim(),
+                category: newProduct.category || 'Custom Orders',
+                selling_price: parseFloat(newProduct.selling_price) || 0,
+                production_cost: 0,
+                is_active: true,
+            }
+            const { data, error } = await supabase.from('products').insert([payload]).select().single()
+            if (error) throw error
+            setProducts(prev => [...prev, data].sort((a, b) => a.name.localeCompare(b.name)))
+            updateItem(idx, 'product_id', data.id)
+            setShowNewProduct(null)
+            setNewProduct({ name: '', category: 'Custom Orders', selling_price: '', production_cost: '' })
+        } catch (err) {
+            console.error('Failed to create product:', err)
+            setError('Failed to create product.')
+        } finally {
+            setSavingInline(false)
+        }
+    }
+
+async function saveOrder() {
         if (!form.client_id) return
         setSaving(true)
         setError('')
@@ -758,34 +974,42 @@ export default function Orders() {
             const client = clients.find(c => c.id === form.client_id)
             const validItems = items.filter(i => i.product_id || i.custom_description?.trim())
 
+            if (validItems.length === 0) {
+                setError('Please add at least one product to the order.')
+                setSaving(false)
+                return
+            }
+
             // If backdated, we inject created_at — everything else is identical
             const backdatedCreatedAt = form.isBackdated && form.orderDate
                 ? new Date(form.orderDate).toISOString()
                 : undefined
 
-            let initialStatus = form.status
-            let finalPrice = parseFloat(form.total_price) || null
-
-            if (form.type === 'standard') {
-                finalPrice = calcTotal(validItems) || null
-                initialStatus = 'ready' // Default to ready, will be updated to in_production later if items are missing
-            }
+            // Calculate total from items
+            const finalPrice = calcTotal(validItems) || parseFloat(form.total_price) || null
+                        const hasCustomItems = validItems.some(i => i.is_custom || (!i.product_id && i.custom_description))
+            const hasStandardItems = validItems.some(i => i.product_id && !i.is_custom)
+            
+            let derivedType = 'standard'
+            if (hasCustomItems) derivedType = 'custom'
+            
+            let initialStatus = hasCustomItems ? 'new' : 'ready'
 
             // Create the order
             const { data: order, error: orderErr } = await supabase
                 .from('orders')
                 .insert([{
-                    type: form.type,
+                    type: derivedType,
                     client_id: form.client_id,
                     status: initialStatus,
                     total_price: finalPrice,
                     deadline: form.deadline || null,
                     notes: form.notes || null,
-                    custom_description: form.type === 'custom' ? form.custom_description : null,
-                    dimensions: form.type === 'custom' ? form.dimensions : null,
-                    reference_notes: form.type === 'custom' ? form.reference_notes : null,
-                    reference_image_url: form.type === 'custom' ? (form.reference_image_url || null) : null,
-                    stl_url: form.type === 'custom' ? (form.stl_url || null) : null,
+                    custom_description: null,
+                    dimensions: null,
+                    reference_notes: null,
+                    reference_image_url: null,
+                    stl_url: null,
                     is_paid: false,
                     ...(backdatedCreatedAt ? { created_at: backdatedCreatedAt } : {}),
                 }])
@@ -793,113 +1017,73 @@ export default function Orders() {
 
             if (orderErr) throw orderErr
 
-            // ── ALWAYS save order items for standard orders ──────────
-            // This must happen regardless of stock status
-            if (form.type === 'standard' && validItems.length > 0) {
-                const { error: itemsErr } = await supabase
-                    .from('order_items')
-                    .insert(
-                        validItems.map(i => ({
-                            order_id: order.id,
-                            product_id: i.product_id || null,
-                            custom_description: i.custom_description || null,
-                            quantity: parseInt(i.quantity) || 1,
-                            unit_price: parseFloat(i.unit_price) || null,
-                        }))
-                    )
-                if (itemsErr) throw itemsErr
-            } else if (form.type === 'custom') {
-                const { error: itemsErr } = await supabase
-                    .from('order_items')
-                    .insert([{
-                        order_id: order.id,
-                        custom_description: form.custom_description || null,
-                        quantity: parseInt(form.quantity) || 1,
-                        unit_price: parseFloat(form.total_price) || null,
-                    }])
-                if (itemsErr) throw itemsErr
-            }
+            // ── PROCESS ITEMS & INVENTORY ─────────────────────────────
+            let queuedCount = 0
+            const itemsToInsert = []
 
-            // ── Fulfill stock and Auto-queue missing items ─────────────
-            if (form.type === 'standard' && validItems.length > 0) {
-                let queuedCount = 0
-                for (const item of validItems.filter(i => i.product_id)) {
-                    const needed = parseInt(item.quantity) || 1
-                    
+            for (const item of validItems) {
+                const needed = parseInt(item.quantity) || 1
+                let fulfilled = 0
+
+                // 1. Custom Items
+                if (item.is_custom || (!item.product_id && item.custom_description)) {
+                    // We no longer queue custom items immediately. They wait until the order reaches 'in_production'.
+                    queuedCount++
+                } 
+                // 2. Standard Items
+                else if (item.product_id) {
                     const { data: stockRow } = await supabase
                         .from('stock')
                         .select('id, quantity_available')
                         .eq('product_id', item.product_id)
                         .maybeSingle()
-                        
+
                     const available = stockRow?.quantity_available || 0
-                    const takingFromStock = Math.min(needed, available)
-                    const missing = needed - takingFromStock
-                    
-                    // 1. Deduct available stock immediately
-                    if (takingFromStock > 0 && stockRow) {
+                    fulfilled = Math.min(needed, available)
+
+                    if (fulfilled > 0 && stockRow) {
+                        // Deduct stock
                         await supabase.from('stock').update({
-                            quantity_available: available - takingFromStock,
+                            quantity_available: available - fulfilled,
                             updated_at: new Date().toISOString(),
                         }).eq('id', stockRow.id)
 
+                        // Log movement
                         await supabase.from('stock_movements').insert([{
                             product_id: item.product_id,
                             type: 'sold',
-                            quantity: takingFromStock,
+                            quantity: fulfilled,
                             is_positive: false,
                             order_id: order.id,
                             notes: `Sold from stock — ${client?.name || ''}`,
                         }])
                     }
-                    
-                    // 2. Queue missing items
-                    if (missing > 0) {
-                        const productRecord = products.find(p => p.id === item.product_id)
-                        const productName = productRecord?.name || 'Unknown'
-                        
-                        const { data: assemblies } = await supabase
-                            .from('product_assemblies')
-                            .select('child_product_id, quantity, products!child_product_id(name)')
-                            .eq('parent_product_id', item.product_id)
-                            
-                        if (assemblies && assemblies.length > 0) {
-                            const payload = assemblies.map(a => ({
-                                order_id: order.id,
-                                product_id: a.child_product_id,
-                                description: `[Part of ${productName}] ${a.products?.name || ''}`,
-                                quantity: missing * (a.quantity || 1),
-                                status: 'queued',
-                                material: 'PLA'
-                            }))
-                            await supabase.from('productions').insert(payload)
-                            queuedCount += assemblies.length
-                        } else {
-                            await supabase.from('productions').insert([{
-                                order_id: order.id,
-                                product_id: item.product_id,
-                                description: productName,
-                                quantity: missing,
-                                status: 'queued',
-                                material: 'PLA'
-                            }])
-                            queuedCount++
-                        }
-                    }
+                    // NOTE: We intentionally DO NOT queue missing standard items anymore (PS1).
                 }
-                
-                // If anything was queued, ensure order tracks it via 'in_production'
-                if (queuedCount > 0) {
-                    await supabase.from('orders')
-                        .update({ status: 'in_production' })
-                        .eq('id', order.id)
-                }
+
+                // Prepare order_item record
+                itemsToInsert.push({
+                    order_id: order.id,
+                    product_id: item.product_id || null,
+                    custom_description: item.custom_description || null,
+                    quantity: needed,
+                    unit_price: parseFloat(item.unit_price) || null,
+                    dimensions: item.dimensions || null,
+                    reference_notes: item.reference_notes || null,
+                    reference_image_url: item.reference_image_url || null,
+                    stl_url: item.stl_url || null,
+                    is_composite: item.is_composite || false,
+                    fulfilled_quantity: fulfilled,
+                })
             }
 
-            // ── Auto-create production for custom orders ─────────────
-            if (form.type === 'custom') {
-                await autoCreateProduction(order, parseInt(form.quantity) || 1)
+            // ── SAVE ALL ORDER ITEMS ──────────────────────────────
+            if (itemsToInsert.length > 0) {
+                const { error: itemsErr } = await supabase.from('order_items').insert(itemsToInsert)
+                if (itemsErr) throw itemsErr
             }
+
+
 
             closeModal()
             await fetchAll()
@@ -1116,22 +1300,7 @@ export default function Orders() {
             if (next === 'paid' && order.type === 'custom') {
                 await createProductFromOrder(order)
             }
-
-            // ── SYNC PRODUCTION (custom orders only) ─────────────────
-            if (order.type === 'custom') {
-                await syncProduction(order.id, next)
-
-                // Auto-create production when confirmed if none exists
-                if (next === 'confirmed') {
-                    const { data: existing } = await supabase
-                        .from('productions')
-                        .select('id')
-                        .eq('order_id', order.id)
-                        .maybeSingle()
-
-                    if (!existing) await autoCreateProduction(order)
-                }
-            }
+            // (Legacy SYNC PRODUCTION removed to prevent duplicate 'Custom order' jobs)
 
             // ── UPDATE LOCAL STATE ────────────────────────────────────
             if (selected?.id === order.id) {
@@ -1151,76 +1320,248 @@ export default function Orders() {
             setSaving(false)
         }
     }
+    const PROD_FLOW = ['queued', 'printing', 'done']
+    const getProdNext = status => { const i = PROD_FLOW.indexOf(status); return (i < 0 || i >= PROD_FLOW.length - 1) ? null : PROD_FLOW[i + 1] }
 
-    // ─── QUEUE MISSING PRODUCTIONS (Assemblies & Standard) ────────
-    async function queueMissingProductions() {
-        if (!selected) return
-        setSaving(true)
+    // ─── INITIATE JOB ADVANCE (from order item card button) ──
+    function initiateJobAdvance(job) {
+        if (advancingJob) return
+        const next = getProdNext(job.status)
+        if (!next) return
+        
+        // If advancing to 'done', show the details modal so user can enter cost/filament/time
+        if (next === 'done') {
+            setAdvanceJobsBatch([job])
+            setJobAdvanceForms({
+                [job.id]: {
+                    filament_grams: job.filament_grams || '',
+                    print_time_hours: job.print_time_hours || '',
+                    actual_cost: job.actual_cost || '',
+                    notes: job.notes || '',
+                    filament_data: job.filament_data || null,
+                }
+            })
+            setShowJobAdvanceModal(true)
+        } else {
+            // For queued -> printing, just advance directly
+            executeJobAdvance(job, next)
+        }
+    }
+
+    // ─── CONFIRM BATCH JOB ADVANCE (from modal - saves details then advances) ──
+    async function confirmJobAdvanceBatch() {
+        if (advanceJobsBatch.length === 0) return
+        
+        for (const job of advanceJobsBatch) {
+            const form = jobAdvanceForms[job.id]
+            if (!form) continue
+
+            // Save details first
+            await supabase.from('productions').update({
+                filament_grams: parseFloat(form.filament_grams) || null,
+                print_time_hours: parseFloat(form.print_time_hours) || null,
+                actual_cost: parseFloat(form.actual_cost) || null,
+                notes: form.notes || null,
+                filament_data: form.filament_data || null,
+            }).eq('id', job.id)
+
+            // Merge updated fields into job for the advance logic
+            const updatedJob = { ...job, ...form }
+            await executeJobAdvance(updatedJob, 'done')
+        }
+
+        setShowJobAdvanceModal(false)
+        setAdvanceJobsBatch([])
+        setJobAdvanceForms({})
+        
+        if (advanceBatchOrder) {
+            await applyStatusChange(advanceBatchOrder, 'ready')
+            setAdvanceBatchOrder(null)
+        }
+    }
+
+    // ─── EXECUTE JOB ADVANCE (the actual status change, mirrors Productions.jsx logic) ──
+    async function executeJobAdvance(job, next) {
+        setAdvancingJob(job.id)
         setError('')
         try {
-            // 1. Fetch order items
-            const { data: rawItems } = await supabase
-                .from('order_items')
-                .select('product_id, quantity, products(name)')
-                .eq('order_id', selected.id)
+            // ── When moving to DONE ────────────────────────────
+            if (next === 'done') {
+                // 1. Consume BOM materials if product linked
+                if (job.product_id) {
+                    const qty = parseInt(job.quantity) || 1
+                    const { data: bom } = await supabase
+                        .from('product_materials')
+                        .select('material_id, quantity_per_unit, materials(id, name, quantity_available)')
+                        .eq('product_id', job.product_id)
 
-            const productItems = (rawItems || []).filter(i => i.product_id)
-            let queuedCount = 0
-
-            for (const item of productItems) {
-                const needed = parseInt(item.quantity) || 1
-
-                const { data: stockRow } = await supabase
-                    .from('stock')
-                    .select('quantity_available')
-                    .eq('product_id', item.product_id)
-                    .maybeSingle()
-
-                const available = stockRow?.quantity_available || 0
-                const missing = Math.max(0, needed - available)
-
-                if (missing > 0) {
-                    // Check if it's an assembly
-                    const { data: assemblies } = await supabase
-                        .from('product_assemblies')
-                        .select('child_product_id, quantity, products!child_product_id(name)')
-                        .eq('parent_product_id', item.product_id)
-
-                    if (assemblies && assemblies.length > 0) {
-                        // Queue the parts
-                        const payload = assemblies.map(a => ({
-                            order_id: selected.id,
-                            product_id: a.child_product_id,
-                            description: `[Part of ${item.products?.name}] ${a.products?.name || ''}`,
-                            quantity: missing * (a.quantity || 1),
-                            status: 'queued',
-                            material: 'PLA'
-                        }))
-                        await supabase.from('productions').insert(payload)
-                        queuedCount += assemblies.length
-                    } else {
-                        // Queue the product itself
-                        await supabase.from('productions').insert([{
-                            order_id: selected.id,
-                            product_id: item.product_id,
-                            description: item.products?.name || 'Production job',
-                            quantity: missing,
-                            status: 'queued',
-                            material: 'PLA'
+                    for (const b of (bom || [])) {
+                        const needed = (b.quantity_per_unit || 1) * qty
+                        const mat = b.materials
+                        if (!mat) continue
+                        await supabase.from('materials').update({
+                            quantity_available: Math.max(0, (mat.quantity_available || 0) - needed),
+                        }).eq('id', mat.id)
+                        await supabase.from('material_movements').insert([{
+                            material_id: mat.id, type: 'used', quantity: needed, is_positive: false,
+                            notes: `Production — ${job.description || ''} ×${qty}`,
                         }])
-                        queuedCount++
+                    }
+                }
+
+                // 2. Sync product cost
+                if (job.product_id && job.actual_cost) {
+                    const unitCost = parseFloat(job.actual_cost) / (parseInt(job.quantity) || 1)
+                    await supabase.from('products').update({ production_cost: unitCost }).eq('id', job.product_id)
+                }
+
+                // 3. Deduct filament spools
+                await deductFilamentFromSpools(job)
+
+                // 4. If order-linked, auto-advance order check
+                if (job.order_id) {
+                    if (job.product_id && job.order_item_id) {
+                        const qty = parseInt(job.quantity) || 1
+                        const { data: oItem } = await supabase.from('order_items').select('fulfilled_quantity').eq('id', job.order_item_id).single()
+                        if (oItem) {
+                            await supabase.from('order_items').update({ fulfilled_quantity: (oItem.fulfilled_quantity || 0) + qty }).eq('id', job.order_item_id)
+                        }
+                    }
+
+                    const { data: order } = await supabase.from('orders')
+                        .select('status, order_items(id, quantity, fulfilled_quantity, custom_description, product_id)')
+                        .eq('id', job.order_id).single()
+
+                    if (order?.status === 'in_production') {
+                        const { data: siblings } = await supabase.from('productions').select('id, status').eq('order_id', job.order_id)
+                        const allJobsDone = (siblings || []).every(s => (s.id === job.id ? true : s.status === 'done'))
+                        const allStandardFulfilled = (order.order_items || [])
+                            .filter(i => i.product_id && !i.is_custom)
+                            .every(i => (i.fulfilled_quantity || 0) >= (i.quantity || 1))
+                        if (allJobsDone && allStandardFulfilled) {
+                            await supabase.from('orders').update({ status: 'ready' }).eq('id', job.order_id)
+                        }
                     }
                 }
             }
 
-            if (queuedCount > 0) {
-                await applyStatusChange(selected, 'in_production')
-            } else {
-                setError('Everything is already in stock. Please click "Mark as Ready".')
+            // ── When moving to PRINTING ───────────────────
+            if (next === 'printing' && job.order_id) {
+                const { data: order } = await supabase.from('orders').select('status').eq('id', job.order_id).single()
+                if (order && ['confirmed', 'quoted', 'new'].includes(order.status)) {
+                    await supabase.from('orders').update({ status: 'in_production' }).eq('id', job.order_id)
+                }
             }
+
+            // ── Update production status ──────────────────
+            await supabase.from('productions').update({ status: next }).eq('id', job.id)
+
+            // Refresh everything
+            await fetchAll()
+            if (selected) {
+                const { data: refreshed } = await supabase.from('orders')
+                    .select('*, order_items(*, products(*)), productions(*)')
+                    .eq('id', selected.id).single()
+                if (refreshed) setSelected(refreshed)
+            }
+
         } catch (err) {
-            console.error('Queue productions error:', err)
-            setError(err.message || 'Failed to queue productions.')
+            console.error('Job advance error:', err)
+            setError(err.message || 'Failed to advance production job.')
+        } finally {
+            setAdvancingJob(null)
+        }
+    }
+
+
+    // ─── FULFILL STANDARD ITEM MANUALLY ────────────────────────────
+    
+    // ─── PRODUCE MISSING STOCK ──────────────────────────────────────────────
+    async function produceMissingStock(item) {
+        setSaving(true)
+        setError('')
+        try {
+            const needed = item.quantity - (item.fulfilled_quantity || 0)
+            if (needed <= 0) return
+
+            // 1. Create production job
+            await supabase.from('productions').insert([{
+                order_id: selected.id,
+                order_item_id: item.id,
+                product_id: item.product_id,
+                description: item.products?.name || 'Stock item',
+                quantity: needed,
+                status: 'queued',
+                material: 'PLA', // Default
+            }])
+
+            // 2. Advance order to in_production if it's currently new or ready
+            if (['new', 'ready', 'waiting_restock'].includes(selected.status)) {
+                await supabase.from('orders').update({ status: 'in_production' }).eq('id', selected.id)
+            }
+
+            // 3. Refresh local state
+            await fetchAll()
+            if (selected) {
+                const { data: refreshed } = await supabase.from('orders').select('*, order_items(*, products(*)), productions(*)').eq('id', selected.id).single()
+                if (refreshed) setSelected(refreshed)
+            }
+
+        } catch (err) {
+            console.error('Produce missing stock error:', err)
+            setError(err.message || 'Failed to start production.')
+        } finally {
+            setSaving(false)
+        }
+    }
+async function fulfillStandardItem(item) {
+        setSaving(true)
+        setError('')
+        try {
+            const needed = item.quantity - (item.fulfilled_quantity || 0)
+            if (needed <= 0) return
+
+            const { data: stockRow } = await supabase
+                .from('stock')
+                .select('id, quantity_available')
+                .eq('product_id', item.product_id)
+                .maybeSingle()
+
+            const available = stockRow?.quantity_available || 0
+            const taking = Math.min(needed, available)
+
+            if (taking === 0) {
+                setError(`No stock available for ${item.products?.name}. Please run a production job first.`)
+                setSaving(false)
+                return
+            }
+
+            // Deduct stock
+            await supabase.from('stock').update({
+                quantity_available: available - taking,
+                updated_at: new Date().toISOString(),
+            }).eq('id', stockRow.id)
+
+            // Log movement
+            await supabase.from('stock_movements').insert([{
+                product_id: item.product_id,
+                type: 'sold',
+                quantity: taking,
+                is_positive: false,
+                order_id: selected.id,
+                notes: `Manual fulfillment — ${selected.clients?.name || ''}`,
+            }])
+
+            // Update order_items fulfilled_quantity
+            const newFulfilled = (item.fulfilled_quantity || 0) + taking
+            await supabase.from('order_items').update({
+                fulfilled_quantity: newFulfilled
+            }).eq('id', item.id)
+
+            await fetchAll()
+        } catch (err) {
+            console.error('Manual fulfill error:', err)
+            setError(err.message || 'Failed to fulfill item.')
         } finally {
             setSaving(false)
         }
@@ -1511,8 +1852,8 @@ export default function Orders() {
                                                     {s.emoji} {s.label}
                                                 </span>
                                                 <span className={`text-xs px-2 py-0.5 rounded-full font-medium
-                          ${o.type === 'custom' ? 'bg-violet-100 text-violet-600' : 'bg-teal-100 text-teal-600'}`}>
-                                                    {o.type === 'custom' ? '✏️ Custom' : '📦 Standard'}
+                          ${o.type === 'custom' ? 'bg-violet-100 text-violet-600' : o.type === 'mixed' ? 'bg-fuchsia-100 text-fuchsia-600' : 'bg-teal-100 text-teal-600'}`}>
+                                                    {o.type === 'custom' ? '✏️ Custom' : o.type === 'mixed' ? '🔀 Mixed' : '📦 Standard'}
                                                 </span>
                                                 {overdue && (
                                                     <span className="text-xs font-semibold px-2 py-0.5 rounded-full bg-red-100 text-red-600">
@@ -1530,9 +1871,47 @@ export default function Orders() {
                                             <p className="font-semibold text-slate-800 leading-tight">
                                                 {o.clients?.name || '—'}
                                             </p>
-                                            <p className="text-xs text-slate-400 mt-0.5 truncate">
-                                                {orderLabel(o)}
-                                            </p>
+                                            <div className="mt-2 space-y-1.5 pr-2">
+                                                {o.order_items?.map((item, idx) => {
+                                                    const isCustom = item.is_custom || item.custom_description
+                                                    
+                                                    // Determine item status
+                                                    let statusUI = null
+                                                    if (isCustom) {
+                                                        const linkedJobs = o.productions?.filter(p => p.order_item_id === item.id) || []
+                                                        if (linkedJobs.length === 0) {
+                                                            statusUI = <span className="text-[10px] font-bold px-1.5 py-0.5 rounded-md bg-slate-100 text-slate-500">Wait. Prod.</span>
+                                                        } else {
+                                                            const allDone = linkedJobs.every(j => j.status === 'done')
+                                                            const anyPrinting = linkedJobs.some(j => j.status === 'printing')
+                                                            const anyFailed = linkedJobs.some(j => j.status === 'failed')
+                                                            
+                                                            if (anyFailed) statusUI = <span className="text-[10px] font-bold px-1.5 py-0.5 rounded-md bg-red-100 text-red-600">Failed</span>
+                                                            else if (anyPrinting) statusUI = <span className="text-[10px] font-bold px-1.5 py-0.5 rounded-md bg-yellow-100 text-yellow-600">Printing</span>
+                                                            else if (allDone) statusUI = <span className="text-[10px] font-bold px-1.5 py-0.5 rounded-md bg-emerald-100 text-emerald-600">Done</span>
+                                                            else statusUI = <span className="text-[10px] font-bold px-1.5 py-0.5 rounded-md bg-blue-100 text-blue-600">Queued</span>
+                                                        }
+                                                    } else {
+                                                        const req = item.quantity || 1
+                                                        const ful = item.fulfilled_quantity || 0
+                                                        if (ful >= req) {
+                                                            statusUI = <span className="text-[10px] font-bold px-1.5 py-0.5 rounded-md bg-emerald-100 text-emerald-600">Stocked</span>
+                                                        } else {
+                                                            statusUI = <span className="text-[10px] font-bold px-1.5 py-0.5 rounded-md bg-pink-100 text-pink-600">{ful}/{req} Stock</span>
+                                                        }
+                                                    }
+
+                                                    return (
+                                                        <div key={idx} className="flex justify-between items-center bg-slate-50/50 rounded p-1.5 border border-slate-100">
+                                                            <span className="text-xs font-semibold text-slate-600 truncate mr-2 flex items-center gap-1.5">
+                                                                <span className="text-slate-400 font-bold">{item.quantity}x</span>
+                                                                {item.products?.name || item.custom_description}
+                                                            </span>
+                                                            {statusUI}
+                                                        </div>
+                                                    )
+                                                })}
+                                            </div>
                                         </div>
 
                                         {/* Price + deadline */}
@@ -1631,23 +2010,7 @@ export default function Orders() {
 
                         <div className="p-5 space-y-5">
 
-                            {/* Type selector */}
-                            <div className="grid grid-cols-2 gap-2">
-                                {[
-                                    { key: 'custom', label: '✏️ Custom', sub: 'Design → Quote → Print' },
-                                    { key: 'standard', label: '📦 Standard', sub: 'From stock / catalogue' },
-                                ].map(t => (
-                                    <button key={t.key}
-                                        onClick={() => setForm(f => ({ ...f, type: t.key, status: 'new' }))}
-                                        className={`p-3 rounded-xl border-2 text-left transition-all
-                      ${form.type === t.key
-                                                ? 'border-sky-400 bg-sky-50'
-                                                : 'border-slate-200 hover:border-slate-300 hover:bg-slate-50'}`}>
-                                        <p className="text-sm font-bold text-slate-800">{t.label}</p>
-                                        <p className="text-xs text-slate-400 mt-0.5">{t.sub}</p>
-                                    </button>
-                                ))}
-                            </div>
+                            
 
                             {/* ── CLIENT SEARCH + INLINE CREATE ── */}
                             <div>
@@ -1737,191 +2100,151 @@ export default function Orders() {
                                 )}
                             </div>
 
-                            {/* ── CUSTOM ORDER FIELDS ── */}
-                            {form.type === 'custom' && (
-                                <div className="space-y-3">
-
-                                    {/* Product name — was "What do they want?" */}
-                                    <div>
-                                        <label className="text-sm font-medium text-slate-700 block mb-1.5">
-                                            Product Name *
-                                        </label>
-                                        <input
-                                            value={form.custom_description}
-                                            onChange={e => setForm(f => ({ ...f, custom_description: e.target.value }))}
-                                            placeholder="e.g. Dragon Keychain, Custom Trophy, Phone Stand..."
-                                            className="w-full border-2 border-slate-200 focus:border-sky-400 rounded-xl px-3 py-2.5 text-sm font-medium focus:outline-none transition-colors" />
-                                        <p className="text-xs text-slate-400 mt-1">
-                                            Name of the product you will make — saved to catalogue when order is paid
-                                        </p>
-                                    </div>
-
-                                    {/* Quantity and Dimensions in same row */}
-                                    <div className="grid grid-cols-2 gap-3">
-                                        {/* Quantity */}
-                                        <div>
-                                            <label className="text-sm font-medium text-slate-700 block mb-1.5">Quantity</label>
-                                            <input
-                                                type="number"
-                                                min="1"
-                                                value={form.quantity}
-                                                onChange={e => setForm(f => ({ ...f, quantity: e.target.value }))}
-                                                className="w-full border-2 border-slate-200 focus:border-sky-400 rounded-xl px-3 py-2.5 text-sm focus:outline-none transition-colors" />
-                                        </div>
-
-                                        {/* Dimensions */}
-                                        <div>
-                                            <label className="text-sm font-medium text-slate-700 block mb-1.5">Dimensions</label>
-                                            <input
-                                                value={form.dimensions}
-                                                onChange={e => setForm(f => ({ ...f, dimensions: e.target.value }))}
-                                                placeholder="e.g. 10×5×3 cm"
-                                                className="w-full border border-slate-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-sky-300" />
-                                        </div>
-                                    </div>
-
-                                    {/* Price */}
-                                    <div>
-                                        <label className="text-sm font-medium text-slate-700 block mb-1.5">
-                                            Price (TND)
-                                            <span className="text-slate-400 font-normal ml-1">— leave empty if not agreed yet</span>
-                                        </label>
-                                        <input
-                                            type="number"
-                                            value={form.total_price}
-                                            onChange={e => setForm(f => ({ ...f, total_price: e.target.value }))}
-                                            placeholder="TBD"
-                                            className="w-full border border-slate-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-sky-300" />
-                                    </div>
-
-                                    {/* Reference / Instructions — now holds the description */}
-                                    <div>
-                                        <label className="text-sm font-medium text-slate-700 block mb-1.5">
-                                            Reference / Instructions
-                                        </label>
-                                        <textarea
-                                            value={form.reference_notes}
-                                            onChange={e => setForm(f => ({ ...f, reference_notes: e.target.value }))}
-                                            placeholder="What the client wants, color preferences, special requirements, reference links..."
-                                            rows={3}
-                                            className="w-full border border-slate-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-sky-300 resize-none" />
-                                    </div>
-
-                                    {/* Reference image and STL */}
-                                    <ImageUpload
-                                        folder="orders/images"
-                                        value={form.reference_image_url}
-                                        onChange={url => setForm(f => ({ ...f, reference_image_url: url }))}
-                                        label="Reference Image — photo from client" />
-
-                                    <StlUpload
-                                        folder="orders/stl"
-                                        value={form.stl_url}
-                                        onChange={url => setForm(f => ({ ...f, stl_url: url }))}
-                                        label="STL File — optional, add when design is ready" />
-
-                                    <div className="bg-violet-50 border border-violet-200 rounded-xl p-3">
-                                        <p className="text-xs text-violet-700 font-medium">
-                                            🖨️ A print job will be queued automatically · 📦 Product added to catalogue when paid
-                                        </p>
-                                    </div>
+                            {/* ── UNIFIED ORDER ITEMS ── */}
+                            <div>
+                                <div className="flex items-center justify-between mb-2">
+                                    <label className="text-sm font-bold text-slate-700">Products *</label>
+                                    <span className="text-xs text-slate-400">{items.length} item{items.length > 1 ? 's' : ''}</span>
                                 </div>
-                            )}
+                                <div className="space-y-3">
+                                    {items.map((item, idx) => (
+                                        <div key={idx} className="bg-slate-50 border-2 border-slate-200 rounded-2xl p-4 space-y-3">
+                                            {/* Mode toggle header */}
+                                            <div className="flex items-center justify-between">
+                                                <div className="flex gap-1.5">
+                                                    <button type="button" onClick={() => updateItem(idx, 'is_custom', false)}
+                                                        className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all ${!item.is_custom ? 'bg-sky-500 text-white shadow-sm' : 'bg-white text-slate-500 border border-slate-200 hover:bg-slate-100'}`}>
+                                                        📦 Catalogue
+                                                    </button>
+                                                    <button type="button" onClick={() => updateItem(idx, 'is_custom', true)}
+                                                        className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all ${item.is_custom ? 'bg-violet-600 text-white shadow-sm' : 'bg-white text-slate-500 border border-slate-200 hover:bg-slate-100'}`}>
+                                                        ✏️ Custom
+                                                    </button>
+                                                </div>
+                                                {items.length > 1 && (
+                                                    <button type="button" onClick={() => setItems(p => p.filter((_, i) => i !== idx))}
+                                                        className="p-1.5 text-red-400 hover:text-red-600 hover:bg-red-50 rounded-lg">
+                                                        <X size={16} />
+                                                    </button>
+                                                )}
+                                            </div>
 
-                            {/* ── STANDARD ORDER ITEMS ── */}
-                            {form.type === 'standard' && (
-                                <div>
-                                    <label className="text-sm font-medium text-slate-700 block mb-2">Items</label>
-                                    <div className="space-y-3">
-                                        {items.map((item, idx) => (
-                                            <div key={idx} className="bg-slate-50 border border-slate-200 rounded-xl p-3 space-y-2">
-                                                <div className="flex gap-2 items-start">
-                                                    <div className="flex-1">
-                                                        {/* Catalogue products only — no custom option */}
-                                                        <select
-                                                            value={item.product_id}
-                                                            onChange={e => updateItem(idx, 'product_id', e.target.value)}
-                                                            className="w-full border border-slate-200 rounded-lg px-2 py-2 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-sky-300">
-                                                            <option value="">— Select from catalogue —</option>
-                                                            {products.map(p => (
-                                                                <option key={p.id} value={p.id}>{p.name}</option>
-                                                            ))}
-                                                        </select>
-
-                                                        {/* Add new product to catalogue inline */}
-                                                        <button
-                                                            onClick={() => setShowNewProduct(showNewProduct === idx ? null : idx)}
-                                                            className="mt-1 text-xs text-sky-500 hover:text-sky-700 flex items-center gap-1">
-                                                            <PackagePlus size={11} />
-                                                            Product not in catalogue? Add it
-                                                        </button>
-                                                    </div>
-
-                                                    {items.length > 1 && (
-                                                        <button
-                                                            onClick={() => setItems(p => p.filter((_, i) => i !== idx))}
-                                                            className="p-2 text-red-400 hover:bg-red-50 rounded-lg mt-0.5 flex-shrink-0">
-                                                            <X size={14} />
-                                                        </button>
+                                            {/* CATALOGUE MODE */}
+                                            {!item.is_custom ? (
+                                                <div className="space-y-2">
+                                                    <select value={item.product_id} onChange={e => updateItem(idx, 'product_id', e.target.value)}
+                                                        className="w-full border border-slate-200 rounded-xl px-3 py-2 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-sky-300">
+                                                        <option value="">— Select from catalogue —</option>
+                                                        {products.filter(p => p.product_type !== 'component' && p.category !== 'Custom Orders').map(p => (
+                                                            <option key={p.id} value={p.id}>{p.name} {p.selling_price ? `(${p.selling_price} TND)` : ''}</option>
+                                                        ))}
+                                                    </select>
+                                                    <button type="button" onClick={() => setShowNewProduct(showNewProduct === idx ? null : idx)}
+                                                        className="text-xs text-sky-500 hover:text-sky-700 flex items-center gap-1 font-medium">
+                                                        <PackagePlus size={12} /> Product not in catalogue? Add it
+                                                    </button>
+                                                    {showNewProduct === idx && (
+                                                        <div className="bg-sky-50 border border-sky-200 rounded-xl p-3 space-y-3 mt-2">
+                                                            <p className="text-xs font-bold text-sky-700 uppercase tracking-wider">New Product</p>
+                                                            <input value={newProduct.name}
+                                                                onChange={e => setNewProduct(p => ({ ...p, name: e.target.value }))}
+                                                                placeholder="Product Name *"
+                                                                className="w-full border border-sky-200 rounded-lg px-3 py-2 text-sm bg-white outline-none focus:ring-2 focus:ring-sky-300" />
+                                                            <div className="grid grid-cols-2 gap-2">
+                                                                <input type="number" value={newProduct.selling_price}
+                                                                    onChange={e => setNewProduct(p => ({ ...p, selling_price: e.target.value }))}
+                                                                    placeholder="Selling Price (TND) *"
+                                                                    className="border border-sky-200 rounded-lg px-3 py-2 text-sm bg-white outline-none" />
+                                                                <select value={newProduct.category}
+                                                                    onChange={e => setNewProduct(p => ({ ...p, category: e.target.value }))}
+                                                                    className="border border-sky-200 rounded-lg px-3 py-2 text-sm bg-white outline-none">
+                                                                    {CATEGORIES.map(c => <option key={c} value={c}>{c}</option>)}
+                                                                </select>
+                                                            </div>
+                                                            <div className="flex gap-2">
+                                                                <button type="button" onClick={() => setShowNewProduct(null)}
+                                                                    className="flex-1 py-2 text-xs border border-slate-200 bg-white rounded-lg hover:bg-slate-50">
+                                                                    Cancel
+                                                                </button>
+                                                                <button type="button" onClick={() => createProductInline(idx)}
+                                                                    disabled={savingInline || !newProduct.name.trim() || !newProduct.selling_price}
+                                                                    className="flex-1 py-2 text-xs bg-sky-500 text-white rounded-lg hover:bg-sky-600 disabled:opacity-50 font-semibold">
+                                                                    {savingInline ? 'Creating...' : '+ Create & Select'}
+                                                                </button>
+                                                            </div>
+                                                        </div>
                                                     )}
                                                 </div>
+                                            ) : (
+                                                /* CUSTOM MODE */
+                                                <div className="space-y-3 bg-white p-3 rounded-xl border border-violet-200">
+                                                    <div>
+                                                        <label className="text-xs font-bold text-violet-700 block mb-1">Product Name *</label>
+                                                        <input type="text" value={item.custom_description || ''}
+                                                            onChange={e => updateItem(idx, 'custom_description', e.target.value)}
+                                                            placeholder="e.g. Dragon Keychain, Custom Lamp..."
+                                                            className="w-full border border-slate-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-violet-300" />
+                                                    </div>
+                                                    <div className="grid grid-cols-2 gap-2">
+                                                        <div>
+                                                            <label className="text-xs font-semibold text-slate-600 block mb-1">Dimensions</label>
+                                                            <input type="text" value={item.dimensions || ''}
+                                                                onChange={e => updateItem(idx, 'dimensions', e.target.value)}
+                                                                placeholder="e.g. 10×5×3 cm"
+                                                                className="w-full border border-slate-200 rounded-lg px-2.5 py-1.5 text-xs" />
+                                                        </div>
+                                                        <div>
+                                                            <label className="text-xs font-semibold text-slate-600 block mb-1">Unit Price (TND)</label>
+                                                            <input type="number" value={item.unit_price || ''}
+                                                                onChange={e => updateItem(idx, 'unit_price', e.target.value)}
+                                                                placeholder="Price"
+                                                                className="w-full border border-slate-200 rounded-lg px-2.5 py-1.5 text-xs" />
+                                                        </div>
+                                                    </div>
+                                                    <div>
+                                                        <label className="text-xs font-semibold text-slate-600 block mb-1">Notes / Instructions</label>
+                                                        <textarea value={item.reference_notes || ''}
+                                                            onChange={e => updateItem(idx, 'reference_notes', e.target.value)}
+                                                            placeholder="Color, special requirements, reference links..."
+                                                            rows={2}
+                                                            className="w-full border border-slate-200 rounded-lg px-2.5 py-1.5 text-xs resize-none" />
+                                                    </div>
+                                                    <div className="space-y-2 pt-1 border-t border-slate-100">
+                                                        <ImageUpload folder="orders/images" value={item.reference_image_url || ''}
+                                                            onChange={url => updateItem(idx, 'reference_image_url', url)}
+                                                            label="Client Reference Image" />
+                                                        <StlUpload folder="orders/stl" value={item.stl_url || ''}
+                                                            onChange={url => updateItem(idx, 'stl_url', url)}
+                                                            label="STL 3D File" />
+                                                        <label className="flex items-center gap-2 pt-2 cursor-pointer border-t border-slate-100 mt-2">
+                                                            <input type="checkbox" checked={item.is_composite || false}
+                                                                onChange={e => updateItem(idx, 'is_composite', e.target.checked)}
+                                                                className="rounded border-slate-300 text-violet-600 focus:ring-violet-500 w-4 h-4" />
+                                                            <span className="text-xs font-bold text-slate-700">This is a composite product (multiple parts)</span>
+                                                        </label>
+                                                    </div>
 
-                                                {/* Inline new product form */}
-                                                {showNewProduct === idx && (
-                                                    <div className="bg-white border-2 border-sky-200 rounded-xl p-3 space-y-2">
-                                                        <p className="text-xs font-bold text-sky-700">Add to Catalogue</p>
-                                                        <input
-                                                            value={newProduct.name}
-                                                            onChange={e => setNewProduct(f => ({ ...f, name: e.target.value }))}
-                                                            placeholder="Product name *"
-                                                            className="w-full border border-slate-200 rounded-lg px-2.5 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-sky-300" />
-                                                        <div className="grid grid-cols-2 gap-2">
-                                                            <select
-                                                                value={newProduct.category}
-                                                                onChange={e => setNewProduct(f => ({ ...f, category: e.target.value }))}
-                                                                className="border border-slate-200 rounded-lg px-2 py-2 text-sm bg-white focus:outline-none">
-                                                                {CATEGORIES.map(c => <option key={c}>{c}</option>)}
-                                                            </select>
-                                                            <input
-                                                                type="number"
-                                                                value={newProduct.selling_price}
-                                                                onChange={e => setNewProduct(f => ({ ...f, selling_price: e.target.value }))}
-                                                                placeholder="Price (TND)"
-                                                                className="border border-slate-200 rounded-lg px-2 py-2 text-sm focus:outline-none" />
-                                                        </div>
-                                                        <div className="flex gap-2">
-                                                            <button
-                                                                onClick={() => setShowNewProduct(null)}
-                                                                className="flex-1 py-1.5 text-xs border border-slate-200 rounded-lg hover:bg-slate-50">
-                                                                Cancel
-                                                            </button>
-                                                            <button
-                                                                onClick={() => createProductInline(idx)}
-                                                                disabled={savingInline || !newProduct.name.trim()}
-                                                                className="flex-1 py-1.5 text-xs bg-sky-500 text-white rounded-lg hover:bg-sky-600 disabled:opacity-50 font-medium">
-                                                                {savingInline ? '...' : '+ Add & Select'}
-                                                            </button>
-                                                        </div>
+                                                </div>
+                                            )}
+
+                                            {/* Quantity + Price row (always visible) */}
+                                            <div className="flex items-center gap-3">
+                                                <div className="w-24">
+                                                    <label className="text-xs font-semibold text-slate-500 block mb-1">Qty</label>
+                                                    <input type="number" min="1" value={item.quantity || 1}
+                                                        onChange={e => updateItem(idx, 'quantity', e.target.value)}
+                                                        className="w-full border border-slate-200 rounded-xl px-3 py-1.5 text-sm" />
+                                                </div>
+                                                {!item.is_custom && (
+                                                    <div className="flex-1">
+                                                        <label className="text-xs font-semibold text-slate-500 block mb-1">Unit Price (TND)</label>
+                                                        <input type="number" value={item.unit_price || ''}
+                                                            onChange={e => updateItem(idx, 'unit_price', e.target.value)}
+                                                            placeholder="Price"
+                                                            className="w-full border border-slate-200 rounded-xl px-3 py-1.5 text-sm" />
                                                     </div>
                                                 )}
-
-                                                <div className="grid grid-cols-2 gap-2">
-                                                    <div>
-                                                        <label className="text-xs text-slate-400 block mb-0.5">Quantity</label>
-                                                        <input
-                                                            type="number" min="1" value={item.quantity}
-                                                            onChange={e => updateItem(idx, 'quantity', e.target.value)}
-                                                            className="w-full border border-slate-200 rounded-lg px-2.5 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-sky-300" />
-                                                    </div>
-                                                    <div>
-                                                        <label className="text-xs text-slate-400 block mb-0.5">Price (TND)</label>
-                                                        <input
-                                                            type="number" value={item.unit_price}
-                                                            onChange={e => updateItem(idx, 'unit_price', e.target.value)}
-                                                            placeholder="0.00"
-                                                            className="w-full border border-slate-200 rounded-lg px-2.5 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-sky-300" />
-                                                    </div>
-                                                </div>
+                                            </div>
                                             </div>
                                         ))}
                                     </div>
@@ -1932,7 +2255,7 @@ export default function Orders() {
                                         + Add item
                                     </button>
 
-                                    {items.some(i => i.unit_price && i.product_id) && (
+                                    {items.some(i => i.unit_price && (i.product_id || i.custom_description?.trim())) && (
                                         <div className="mt-2 bg-emerald-50 border border-emerald-200 rounded-xl px-3 py-2 text-sm font-bold text-emerald-700">
                                             Total: {calcTotal(items).toFixed(2)} TND
                                         </div>
@@ -1944,7 +2267,6 @@ export default function Orders() {
                                         </p>
                                     </div>
                                 </div>
-                            )}
 
                             {/* Deadline */}
                             <div>
@@ -2022,7 +2344,7 @@ export default function Orders() {
                                 Cancel
                             </button>
                             <button onClick={saveOrder}
-                                disabled={saving || !form.client_id || (form.type === 'custom' && !form.custom_description?.trim()) || (form.isBackdated && !form.orderDate)}
+                                disabled={saving || !form.client_id || items.filter(i => i.product_id || i.custom_description?.trim()).length === 0 || (form.isBackdated && !form.orderDate)}
                                 className={`flex-1 py-3 disabled:opacity-50 text-white rounded-xl text-sm font-semibold transition-colors
                                     ${form.isBackdated ? 'bg-amber-500 hover:bg-amber-600' : 'bg-sky-500 hover:bg-sky-600'}`}>
                                 {saving ? 'Creating...' : form.isBackdated ? '🕐 Create Backdated Order' : 'Create Order'}
@@ -2379,78 +2701,145 @@ export default function Orders() {
                                 </div>
                             </div>
 
-                            {/* Custom details */}
-                            {selected.type === 'custom' && selected.custom_description && (
-                                <div className="bg-violet-50 border border-violet-100 rounded-xl p-3">
-                                    <p className="text-xs font-bold text-violet-500 mb-1.5">📋 Request Details</p>
-                                    <p className="text-sm text-slate-700">{selected.custom_description}</p>
-                                    {selected.dimensions && (
-                                        <p className="text-xs text-slate-500 mt-1.5 font-medium">📐 {selected.dimensions}</p>
-                                    )}
-                                </div>
-                            )}
-
-                            {selected.reference_notes && (
-                                <div className="bg-amber-50 border border-amber-100 rounded-xl p-3">
-                                    <p className="text-xs font-bold text-amber-600 mb-1">🗒️ Reference / Instructions</p>
-                                    <p className="text-sm text-slate-700">{selected.reference_notes}</p>
-                                </div>
-                            )}
-
-                            {/* Reference image */}
-                            {selected.reference_image_url && (
-                                <div>
-                                    <p className="text-xs font-bold text-slate-400 uppercase tracking-wider mb-2">
-                                        📸 Client Reference Image
-                                    </p>
-                                    <div className="rounded-xl overflow-hidden border border-slate-200">
-                                        <img
-                                            src={selected.reference_image_url}
-                                            alt="Reference"
-                                            className="w-full max-h-64 object-contain bg-slate-50" />
-                                    </div>
-                                </div>
-                            )}
-
-                            {/* STL file */}
-                            {selected.stl_url && (
-                                <a href={selected.stl_url} download target="_blank" rel="noreferrer"
-                                    className="flex items-center gap-3 bg-violet-50 border border-violet-200 rounded-xl px-4 py-3 hover:bg-violet-100 transition-colors">
-                                    <div className="p-2 bg-violet-100 rounded-lg">
-                                        <Box size={16} className="text-violet-600" />
-                                    </div>
-                                    <div className="flex-1 min-w-0">
-                                        <p className="text-sm font-semibold text-violet-700">STL File</p>
-                                        <p className="text-xs text-violet-400">Click to download design file</p>
-                                    </div>
-                                    <Download size={16} className="text-violet-500 flex-shrink-0" />
-                                </a>
-                            )}
-
-                            {/* Standard items */}
+                            {/* ── ORDER ITEMS ── */}
                             {(selected.order_items || []).length > 0 && (
                                 <div>
                                     <p className="text-xs font-bold text-slate-400 uppercase tracking-wider mb-2">Items</p>
-                                    <div className="space-y-2">
-                                        {selected.order_items.map(item => (
-                                            <div key={item.id} className="flex items-center justify-between bg-slate-50 rounded-xl px-3 py-2.5">
-                                                <div>
-                                                    <p className="text-sm font-medium text-slate-700">
-                                                        {item.products?.name || item.custom_description || 'Item'}
-                                                    </p>
-                                                    <p className="text-xs text-slate-400">×{item.quantity}</p>
+                                    <div className="space-y-3">
+                                        {selected.order_items.map(item => {
+                                            const isCustom = !!item.custom_description;
+                                            const needed = parseInt(item.quantity) || 1;
+                                            const fulfilled = item.fulfilled_quantity || 0;
+                                            
+                                            // Find linked productions for custom items
+                                            let linkedJobs = [];
+                                            if (isCustom && selected.productions) {
+                                                linkedJobs = selected.productions.filter(p => p.order_item_id === item.id);
+                                            }
+
+                                            return (
+                                                <div key={item.id} className="bg-slate-50 border border-slate-200 rounded-xl p-3">
+                                                    <div className="flex items-start justify-between mb-2">
+                                                        <div>
+                                                            <p className="text-sm font-bold text-slate-800 flex items-center gap-2">
+                                                                {item.custom_description ? '✏️ ' : '📦 '}
+                                                                {item.products?.name || item.custom_description || 'Item'}
+                                                            </p>
+                                                            <p className="text-xs font-semibold text-slate-500 mt-0.5">
+                                                                {item.quantity} × {item.unit_price ? `${parseFloat(item.unit_price).toFixed(2)} TND` : '—'}
+                                                            </p>
+                                                        </div>
+                                                        <p className="text-sm font-bold text-slate-800">
+                                                            {item.unit_price ? `${(parseFloat(item.unit_price) * parseInt(item.quantity)).toFixed(2)} TND` : '—'}
+                                                        </p>
+                                                    </div>
+
+                                                    {/* Custom Details for this Item */}
+                                                    {(item.dimensions || item.reference_notes || item.reference_image_url || item.stl_url || item.is_composite) && (
+                                                        <div className="bg-white border border-slate-200 rounded-lg p-2.5 mt-2 mb-3 space-y-2">
+                                                            {item.dimensions && (
+                                                                <p className="text-xs text-slate-600 font-medium">
+                                                                    <span className="text-slate-400">Dimensions:</span> {item.dimensions}
+                                                                </p>
+                                                            )}
+                                                            {item.reference_notes && (
+                                                                <div className="bg-amber-50 border border-amber-100 rounded-lg p-2">
+                                                                    <p className="text-[10px] font-bold text-amber-600 uppercase mb-0.5">Instructions</p>
+                                                                    <p className="text-xs text-slate-700">{item.reference_notes}</p>
+                                                                </div>
+                                                            )}
+                                                            <div className="flex flex-wrap gap-2 pt-1">
+                                                                {item.reference_image_url && (
+                                                                    <a href={item.reference_image_url} target="_blank" rel="noreferrer"
+                                                                        className="flex items-center gap-1.5 px-2 py-1 bg-sky-50 text-sky-600 border border-sky-100 rounded-md text-[11px] font-semibold hover:bg-sky-100">
+                                                                        <Image size={12} /> View Reference
+                                                                    </a>
+                                                                )}
+                                                                {item.stl_url && (
+                                                                    <a href={item.stl_url} download target="_blank" rel="noreferrer"
+                                                                        className="flex items-center gap-1.5 px-2 py-1 bg-violet-50 text-violet-600 border border-violet-100 rounded-md text-[11px] font-semibold hover:bg-violet-100">
+                                                                        <Box size={12} /> Download STL
+                                                                    </a>
+                                                                )}
+                                                                {item.is_composite && (
+                                                                    <span className="flex items-center gap-1.5 px-2 py-1 bg-fuchsia-50 text-fuchsia-600 border border-fuchsia-100 rounded-md text-[11px] font-semibold">
+                                                                        🧩 Composite Product
+                                                                    </span>
+                                                                )}
+                                                            </div>
+                                                        </div>
+                                                    )}
+
+                                                    {/* Mini-Pipeline per Item */}
+                                                    <div className="mt-3 border-t border-slate-200 pt-3">
+                                                        {isCustom ? (
+                                                            <div className="space-y-2">
+                                                                <p className="text-[10px] font-bold text-fuchsia-500 uppercase tracking-wide">Production Pipeline</p>
+                                                                {linkedJobs.length > 0 ? linkedJobs.map(job => {
+                                                                    const jobNext = getProdNext(job.status)
+                                                                    const isAdvancing = advancingJob === job.id
+                                                                    return (
+                                                                    <div key={job.id} className="bg-white border border-slate-200 rounded-xl p-3 shadow-sm flex flex-col gap-2">
+                                                                        <div className="flex justify-between items-start">
+                                                                            <span className="font-semibold text-slate-700 leading-tight pr-2" title={job.description}>{job.description}</span>
+                                                                            <span className={`text-[9px] font-bold px-2 py-0.5 rounded-full uppercase shrink-0 ${job.status === 'done' ? 'bg-emerald-100 text-emerald-700' : job.status === 'printing' ? 'bg-yellow-100 text-yellow-700' : job.status === 'failed' ? 'bg-red-100 text-red-600' : 'bg-slate-100 text-slate-500'}`}>
+                                                                                {job.status}
+                                                                            </span>
+                                                                        </div>
+                                                                        {/* Mini details */}
+                                                                        {(job.filament_grams || job.print_time_hours || job.actual_cost) && (
+                                                                            <div className="flex flex-wrap gap-1.5 border-t border-slate-50 pt-1.5">
+                                                                                {job.filament_grams && <span className="text-[9px] font-medium text-slate-500 bg-slate-50 px-1.5 py-0.5 rounded shadow-sm">🧵 {job.filament_grams}g</span>}
+                                                                                {job.print_time_hours && <span className="text-[9px] font-medium text-slate-500 bg-slate-50 px-1.5 py-0.5 rounded shadow-sm">⏱ {job.print_time_hours}h</span>}
+                                                                                {job.actual_cost && <span className="text-[9px] font-bold text-sky-700 bg-sky-50 px-1.5 py-0.5 rounded shadow-sm">{job.actual_cost} TND</span>}
+                                                                            </div>
+                                                                        )}
+                                                                        {/* Progress dots */}
+                                                                        {job.status !== 'failed' && (
+                                                                            <div className="flex gap-0.5 mt-auto pb-1">
+                                                                                {['queued', 'printing', 'done'].map((step, si) => (
+                                                                                    <div key={step} className={`h-1 flex-1 rounded-full transition-colors ${si <= ['queued','printing','done'].indexOf(job.status) ? (job.status === 'done' ? 'bg-emerald-500' : job.status === 'printing' ? 'bg-yellow-400' : 'bg-slate-400') : 'bg-slate-100'}`} />
+                                                                                ))}
+                                                                            </div>
+                                                                        )}
+                                                                        {/* Action buttons */}
+                                                                        {jobNext && job.status !== 'failed' && !TERMINAL.includes(selected.status) && (
+                                                                            <button
+                                                                                onClick={() => initiateJobAdvance(job)}
+                                                                                disabled={!!advancingJob}
+                                                                                className={`w-full py-1.5 mt-1 rounded-lg text-[11px] font-bold transition-all border shadow-sm ${jobNext === 'done' ? 'bg-emerald-500 hover:bg-emerald-600 text-white border-emerald-500' : 'bg-yellow-400 hover:bg-yellow-500 text-white border-yellow-400'}`}>
+                                                                                {isAdvancing ? '...' : (jobNext === 'printing' ? '▶ Start Print' : '✓ Mark Done')}
+                                                                            </button>
+                                                                        )}
+                                                                    </div>
+                                                                    )}) : (
+                                                                    <div className="text-xs font-semibold text-slate-400 italic bg-white border border-dashed border-slate-200 p-2 rounded-lg text-center">No production jobs found.</div>
+                                                                )}
+                                                            </div>
+                                                        ) : (
+                                                            <div>
+                                                                <div className="flex justify-between items-center mb-1.5">
+                                                                    <span className="text-[10px] font-bold text-sky-500 uppercase tracking-wide">Stock Fulfillment</span>
+                                                                    <span className="text-[11px] font-bold text-slate-600">{fulfilled} / {needed}</span>
+                                                                </div>
+                                                                <div className="w-full bg-slate-200 rounded-full h-2 mb-2.5 overflow-hidden shadow-inner">
+                                                                    <div className="bg-sky-500 h-2 rounded-full transition-all duration-500" style={{ width: `${Math.min(100, (fulfilled/needed)*100)}%` }}></div>
+                                                                </div>
+                                                                {fulfilled < needed && !TERMINAL.includes(selected.status) && (
+                                                                    <button onClick={() => fulfillStandardItem(item)} disabled={saving} className="w-full text-xs font-bold py-2 bg-sky-50 text-sky-600 border border-sky-100 hover:bg-sky-500 hover:text-white rounded-lg transition-colors flex items-center justify-center gap-1.5 shadow-sm">
+                                                                        <PackagePlus size={14}/> Take Stock
+                                                                    </button>
+                                                                )}
+                                                            </div>
+                                                        )}
+                                                    </div>
                                                 </div>
-                                                <p className="text-sm font-bold text-slate-700">
-                                                    {item.unit_price
-                                                        ? `${(parseFloat(item.unit_price) * parseInt(item.quantity)).toFixed(2)} TND`
-                                                        : '—'}
-                                                </p>
-                                            </div>
-                                        ))}
+                                            )
+                                        })}
                                         {selected.total_price && (
-                                            <div className="flex justify-between px-3 py-2 font-bold text-sm text-slate-800">
-                                                <span>Total</span>
-                                                <span>{parseFloat(selected.total_price).toFixed(2)} TND</span>
+                                            <div className="flex items-center justify-between px-3 py-2 bg-slate-100 rounded-xl">
+                                                <span className="text-xs font-bold text-slate-500 uppercase">Total Price</span>
+                                                <span className="text-sm font-bold text-slate-800">{parseFloat(selected.total_price).toFixed(2)} TND</span>
                                             </div>
                                         )}
                                     </div>
@@ -2864,6 +3253,114 @@ export default function Orders() {
                 </div>
             )}
 
+            {/* ═══ JOB ADVANCE DETAILS MODAL (BATCH) ═══ */}
+            {showJobAdvanceModal && advanceJobsBatch.length > 0 && (
+                <div className="fixed inset-0 bg-black/50 backdrop-blur-sm flex items-center justify-center z-[60] p-4" onClick={() => {}}>
+                    <div className="bg-white rounded-3xl shadow-2xl w-full max-w-lg max-h-[90vh] overflow-hidden flex flex-col" onClick={e => e.stopPropagation()}>
+                        <div className="bg-gradient-to-r from-emerald-500 to-teal-500 p-5 flex-shrink-0">
+                            <h3 className="text-white font-bold text-lg">✓ Complete Production Jobs</h3>
+                            <p className="text-emerald-100 text-sm mt-1">Please provide the details for the completed parts below.</p>
+                        </div>
+                        
+                        <div className="flex-1 overflow-y-auto p-5 space-y-6">
+                            {advanceJobsBatch.map((job, index) => {
+                                const form = jobAdvanceForms[job.id] || {}
+                                return (
+                                    <div key={job.id} className="bg-slate-50 border border-slate-200 rounded-2xl p-4 shadow-sm relative">
+                                        <div className="absolute top-0 right-0 bg-emerald-100 text-emerald-700 text-[10px] font-bold px-2 py-1 rounded-bl-lg rounded-tr-xl uppercase tracking-wider">
+                                            Part {index + 1}
+                                        </div>
+                                        <h4 className="font-bold text-slate-800 text-sm mb-3 pr-12">{job.description || 'Production Job'}</h4>
+                                        
+                                        {/* 3MF Import button */}
+                                        <div className="mb-4">
+                                            <button
+                                                type="button"
+                                                onClick={() => setActive3mfJobId(job.id)}
+                                                className="w-full flex items-center justify-center gap-2 py-2.5 border-2 border-dashed border-violet-300 hover:border-violet-400 hover:bg-violet-50 text-violet-600 rounded-xl text-sm font-semibold transition-all">
+                                                📁 Import from .3mf file
+                                                <span className="text-[10px] font-normal text-violet-400 hidden sm:inline">— auto-fills filament & time</span>
+                                            </button>
+                                            {form.filament_data && (
+                                                <div className="mt-2 flex items-center gap-2 bg-violet-50 border border-violet-200 rounded-xl px-3 py-1.5">
+                                                    <span className="text-xs text-violet-700 font-medium flex-1">
+                                                        ✅ {form.filament_data.length} color{form.filament_data.length !== 1 ? 's' : ''} imported
+                                                        {' · '}{form.filament_data.reduce((s, f) => s + f.grams, 0).toFixed(1)}g
+                                                    </span>
+                                                    <button
+                                                        type="button"
+                                                        onClick={() => setJobAdvanceForms(prev => ({ ...prev, [job.id]: { ...prev[job.id], filament_data: null } }))}
+                                                        className="text-[10px] uppercase font-bold text-violet-400 hover:text-red-500 transition-colors">
+                                                        ✕ clear
+                                                    </button>
+                                                </div>
+                                            )}
+                                        </div>
+
+                                        <div className="grid grid-cols-2 gap-3 mb-3">
+                                            <div>
+                                                <label className="text-xs font-bold text-slate-600 block mb-1">Filament (g)</label>
+                                                <input type="number" value={form.filament_grams}
+                                                    onChange={e => setJobAdvanceForms(prev => ({ ...prev, [job.id]: { ...prev[job.id], filament_grams: e.target.value } }))}
+                                                    placeholder="e.g. 45"
+                                                    className="w-full border border-slate-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-300" />
+                                            </div>
+                                            <div>
+                                                <label className="text-xs font-bold text-slate-600 block mb-1">Print Time (h)</label>
+                                                <input type="number" step="0.1" value={form.print_time_hours}
+                                                    onChange={e => setJobAdvanceForms(prev => ({ ...prev, [job.id]: { ...prev[job.id], print_time_hours: e.target.value } }))}
+                                                    placeholder="e.g. 2.5"
+                                                    className="w-full border border-slate-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-300" />
+                                            </div>
+                                        </div>
+                                        <div className="mb-3">
+                                            <label className="text-xs font-bold text-slate-600 block mb-1">Actual Cost (TND)</label>
+                                            <input type="number" step="0.01" value={form.actual_cost}
+                                                onChange={e => setJobAdvanceForms(prev => ({ ...prev, [job.id]: { ...prev[job.id], actual_cost: e.target.value } }))}
+                                                placeholder="Total cost for this part"
+                                                className="w-full border border-slate-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-300" />
+                                        </div>
+                                        <div>
+                                            <label className="text-xs font-bold text-slate-600 block mb-1">Notes</label>
+                                            <textarea value={form.notes}
+                                                onChange={e => setJobAdvanceForms(prev => ({ ...prev, [job.id]: { ...prev[job.id], notes: e.target.value } }))}
+                                                placeholder="Optional notes..."
+                                                rows={1}
+                                                className="w-full border border-slate-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-300 resize-none" />
+                                        </div>
+                                    </div>
+                                )
+                            })}
+                        </div>
+                        
+                        <div className="p-5 border-t bg-white flex-shrink-0">
+                            <div className="flex gap-2">
+                                <button onClick={() => { 
+                                        setShowJobAdvanceModal(false); 
+                                        setAdvanceJobsBatch([]);
+                                        setAdvanceBatchOrder(null);
+                                        setJobAdvanceForms({});
+                                        setActive3mfJobId(null);
+                                    }}
+                                    className="flex-1 py-2.5 border border-slate-200 text-slate-600 rounded-xl text-sm font-semibold hover:bg-slate-50 transition-colors">
+                                    Cancel
+                                </button>
+                                <button onClick={confirmJobAdvanceBatch}
+                                    className="flex-[2] py-2.5 bg-emerald-500 text-white rounded-xl text-sm font-bold hover:bg-emerald-600 shadow-lg shadow-emerald-500/30 transition-colors">
+                                    ✓ Mark ALL as Done
+                                </button>
+                            </div>
+                        </div>
+
+                        {active3mfJobId && (
+                            <Import3mfModal
+                                onImport={handleAdvanceJobImport3mf}
+                                onClose={() => setActive3mfJobId(null)} />
+                        )}
+                    </div>
+                </div>
+            )}
+
             {/* ═══════════════════════════════════════════════════════
                 PACKAGING MODAL
             ═══════════════════════════════════════════════════════ */}
@@ -3070,6 +3567,127 @@ export default function Orders() {
                     </div>
                 </div>
             )}
+            {/* ══════════════════════════════════════════════════════
+          JOB CONFIGURATOR MODAL (DEFERRED PRODUCTION)
+      ══════════════════════════════════════════════════════ */}
+            {showJobConfigModal && pendingCustomItems.length > 0 && (
+                <div className="fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4">
+                    <div className="bg-white rounded-3xl shadow-xl w-full max-w-lg overflow-hidden flex flex-col max-h-[90vh]">
+                        <div className="px-6 py-5 border-b border-slate-100 flex items-center justify-between bg-white sticky top-0 z-10">
+                            <div>
+                                <h2 className="text-xl font-bold text-slate-800 flex items-center gap-2">
+                                    <Printer size={22} className="text-fuchsia-500" />
+                                    Configure Production Jobs
+                                </h2>
+                                <p className="text-xs text-slate-500 mt-1">
+                                    Item {currentConfigItemIndex + 1} of {pendingCustomItems.length}
+                                </p>
+                            </div>
+                        </div>
+
+                        <div className="p-6 overflow-y-auto space-y-4">
+                            {error && (
+                                <div className="bg-red-50 text-red-600 px-4 py-3 rounded-xl text-sm font-medium border border-red-100 flex items-center gap-2">
+                                    <AlertCircle size={16} />
+                                    {error}
+                                </div>
+                            )}
+                            
+                            <div className="mb-4">
+                                <h3 className="font-bold text-slate-800 text-lg">
+                                    {pendingCustomItems[currentConfigItemIndex].custom_description || 'Custom Item'}
+                                </h3>
+                                <p className="text-sm text-slate-500 mt-0.5">
+                                    Quantity: {pendingCustomItems[currentConfigItemIndex].quantity}
+                                </p>
+                            </div>
+
+                            <label className="flex items-center gap-2 pt-2 cursor-pointer border-t border-b border-slate-100 py-4 mb-4">
+                                <input type="checkbox" checked={isItemComposite}
+                                    onChange={e => setIsItemComposite(e.target.checked)}
+                                    className="rounded border-slate-300 text-fuchsia-600 focus:ring-fuchsia-500 w-4 h-4" />
+                                <div>
+                                    <span className="text-sm font-bold text-slate-700 block">This is a composite product</span>
+                                    <span className="text-xs text-slate-500">Check this if you need to break this item down into multiple printed parts.</span>
+                                </div>
+                            </label>
+
+                            {isItemComposite ? (
+                                <div className="bg-slate-50 border border-slate-200 rounded-xl p-4">
+                                    <div className="flex items-center justify-between mb-2">
+                                        <span className="text-sm font-bold text-slate-700">Parts List</span>
+                                        <span className="text-xs font-semibold text-slate-500">
+                                            For 1 unit of {pendingCustomItems[currentConfigItemIndex].custom_description || 'Custom Item'}
+                                        </span>
+                                    </div>
+                                    
+                                    <div className="space-y-2">
+                                        {compositeParts.map((part, idx) => (
+                                            <div key={idx} className="flex gap-2">
+                                                <input
+                                                    type="text"
+                                                    value={part.name}
+                                                    onChange={e => {
+                                                        const newParts = [...compositeParts]
+                                                        newParts[idx].name = e.target.value
+                                                        setCompositeParts(newParts)
+                                                    }}
+                                                    placeholder={`e.g. Base, Lid, Arm...`}
+                                                    className="flex-1 border border-slate-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-fuchsia-300"
+                                                />
+                                                <input
+                                                    type="number"
+                                                    min="1"
+                                                    value={part.quantity}
+                                                    onChange={e => {
+                                                        const newParts = [...compositeParts]
+                                                        newParts[idx].quantity = parseInt(e.target.value) || 1
+                                                        setCompositeParts(newParts)
+                                                    }}
+                                                    className="w-20 border border-slate-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-fuchsia-300"
+                                                />
+                                                {compositeParts.length > 1 && (
+                                                    <button
+                                                        onClick={() => setCompositeParts(p => p.filter((_, i) => i !== idx))}
+                                                        className="p-2 text-red-400 hover:bg-red-50 rounded-lg transition-colors">
+                                                        <X size={16} />
+                                                    </button>
+                                                )}
+                                            </div>
+                                        ))}
+                                    </div>
+                                    <button
+                                        onClick={() => setCompositeParts(p => [...p, { name: '', quantity: 1 }])}
+                                        className="mt-3 text-xs font-semibold text-fuchsia-600 hover:text-fuchsia-700 flex items-center gap-1">
+                                        + Add another part
+                                    </button>
+                                </div>
+                            ) : (
+                                <div className="bg-slate-50 border border-slate-200 rounded-xl p-4 text-sm text-slate-600">
+                                    <p>A single production job will be created for this item.</p>
+                                </div>
+                            )}
+                        </div>
+
+                        <div className="px-6 py-5 border-t border-slate-100 bg-slate-50 flex gap-3 sticky bottom-0">
+                            <button onClick={() => {
+                                setShowJobConfigModal(false)
+                                setPendingCustomItems([])
+                                setTargetConfigOrder(null)
+                            }}
+                                className="flex-1 py-2.5 px-4 text-slate-600 font-semibold hover:bg-slate-200 bg-slate-100 rounded-xl transition-colors text-sm">
+                                Cancel Production
+                            </button>
+                            <button onClick={confirmJobConfig}
+                                disabled={splitting || (isItemComposite && compositeParts.filter(p => p.name.trim()).length === 0)}
+                                className="flex-1 py-2.5 px-4 bg-fuchsia-500 hover:bg-fuchsia-600 disabled:opacity-50 text-white font-semibold rounded-xl transition-colors text-sm flex justify-center items-center gap-2 shadow-sm shadow-fuchsia-200">
+                                {splitting ? 'Saving...' : (currentConfigItemIndex + 1 < pendingCustomItems.length ? 'Next Item' : 'Confirm & Generate')}
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
+
             {/* ══════════════════════════════════════════════════════
           PAYMENT DATE MODAL
       ══════════════════════════════════════════════════════ */}

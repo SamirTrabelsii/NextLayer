@@ -7,12 +7,17 @@ import StlUpload from '../components/StlUpload'
 
 const CATEGORIES = ['All', 'Keychains', 'Clickers', 'Decorations', 'Parts', 'Custom Orders']
 const MATERIALS = ['PLA', 'PETG', 'ABS', 'TPU', 'Resin', 'Other']
+const PRODUCT_TYPES = [
+    { key: 'sellable', label: '🛒 Sellable', desc: 'Sold directly to customers' },
+    { key: 'component', label: '🧩 Component', desc: 'Used as a part in composite products' },
+    { key: 'both', label: '🛒🧩 Both', desc: 'Sellable and usable as a component' },
+]
 
 const empty = {
     name: '', category: 'Keychains', material: 'PLA', color: '',
     print_time_hours: '', filament_grams: '', production_cost: '',
     selling_price: '', description: '', is_active: true,
-    image_url: '', stl_url: '',   // ← add these
+    image_url: '', stl_url: '', product_type: 'sellable',
 }
 
 export default function Products() {
@@ -323,7 +328,7 @@ export default function Products() {
 
                                 <div className="flex items-start justify-between mb-3">
                                     <div>
-                                        <div className="flex items-center gap-2 mb-1">
+                                        <div className="flex items-center gap-2 mb-1 flex-wrap">
                                             {isCustomOrder ? (
                                                 <span className="inline-flex items-center gap-1 text-xs font-semibold text-violet-700 bg-violet-100/80 border border-violet-200 px-2 py-0.5 rounded-full shadow-sm">
                                                     <Sparkles size={10} className="text-violet-500 animate-pulse" /> {p.category}
@@ -332,6 +337,12 @@ export default function Products() {
                                                 <span className="text-xs font-medium text-sky-600 bg-sky-50 px-2 py-0.5 rounded-full">
                                                     {p.category}
                                                 </span>
+                                            )}
+                                            {(p.product_type === 'component' || p.product_type === 'both') && (
+                                                <span className="text-xs font-medium text-violet-600 bg-violet-50 px-1.5 py-0.5 rounded-full">🧩 Part</span>
+                                            )}
+                                            {p.product_type === 'both' && (
+                                                <span className="text-xs font-medium text-teal-600 bg-teal-50 px-1.5 py-0.5 rounded-full">🛒 Sell</span>
                                             )}
                                             {p.stl_url && (
                                                 <a href={p.stl_url} download target="_blank" rel="noreferrer"
@@ -436,6 +447,26 @@ export default function Products() {
                                         {MATERIALS.map(m => <option key={m}>{m}</option>)}
                                     </select>
                                 </div>
+                            </div>
+
+                            {/* Product Type */}
+                            <div>
+                                <label className="text-sm font-medium text-slate-700 block mb-1">Product Type</label>
+                                <div className="flex gap-2">
+                                    {PRODUCT_TYPES.map(t => (
+                                        <button key={t.key} type="button"
+                                            onClick={() => setForm(f => ({ ...f, product_type: t.key }))}
+                                            className={`flex-1 py-2 px-2 rounded-xl text-xs font-semibold border-2 transition-all
+                                                ${form.product_type === t.key
+                                                    ? 'border-sky-400 bg-sky-50 text-sky-700'
+                                                    : 'border-slate-200 bg-white text-slate-500 hover:border-slate-300'}`}>
+                                            {t.label}
+                                        </button>
+                                    ))}
+                                </div>
+                                <p className="text-xs text-slate-400 mt-1">
+                                    {PRODUCT_TYPES.find(t => t.key === form.product_type)?.desc}
+                                </p>
                             </div>
 
                             {/* Color */}
@@ -593,7 +624,7 @@ export default function Products() {
                                         onChange={e => setAssemblyItem(f => ({ ...f, child_product_id: e.target.value }))}
                                         className="flex-1 border border-slate-200 rounded-xl px-3 py-2 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-sky-300">
                                         <option value="">Add a part...</option>
-                                        {products.filter(p => p.id !== editing && !productAssemblies.find(a => a.child_product_id === p.id)).map(p => (
+                                        {products.filter(p => p.id !== editing && !productAssemblies.find(a => a.child_product_id === p.id) && (p.product_type === 'component' || p.product_type === 'both')).map(p => (
                                             <option key={p.id} value={p.id}>{p.name}</option>
                                         ))}
                                     </select>

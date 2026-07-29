@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react'
 import { supabase } from '../lib/supabase'
-import { Plus, X, Package, History } from 'lucide-react'
+import { Plus, X, Package, History, Trash2 } from 'lucide-react'
 
 const MANUAL_TYPES = [
   { key: 'adjustment', label: 'Stock Adjustment', emoji: '⚙️', color: 'text-slate-600', sign: 1, desc: 'Correction, found more stock' },
@@ -29,6 +29,7 @@ export default function Stock() {
   const [stock, setStock] = useState([])
   const [movements, setMovements] = useState([])
   const [products, setProducts] = useState([])
+  const [assemblies, setAssemblies] = useState([])
   const [loading, setLoading] = useState(true)
   const [showModal, setShowModal] = useState(false)
   const [showHistory, setShowHistory] = useState(null)
@@ -46,15 +47,30 @@ export default function Stock() {
 
   async function fetchAll() {
     setLoading(true)
-    const [{ data: st }, { data: mv }, { data: pr }] = await Promise.all([
+    const [{ data: st }, { data: mv }, { data: pr }, { data: assem }] = await Promise.all([
       supabase.from('stock').select('*, products(id,name,category,selling_price)').order('updated_at', { ascending: false }),
       supabase.from('stock_movements').select('*, products(name), clients(name)').order('created_at', { ascending: false }),
       supabase.from('products').select('id,name,category').eq('is_active', true).order('name'),
+      supabase.from('product_assemblies').select('parent_product_id, child_product_id, quantity'),
     ])
     setStock(st || [])
     setMovements(mv || [])
     setProducts(pr || [])
+    setAssemblies(assem || [])
     setLoading(false)
+  }
+
+  async function removeStockItem(id) {
+    if (window.confirm("Are you sure you want to delete this stock card? This removes the stock counts from tracking, but will NOT delete the product from your catalogue.")) {
+      try {
+        const { error: err } = await supabase.from('stock').delete().eq('id', id)
+        if (err) throw err
+        fetchAll()
+      } catch (err) {
+        console.error(err)
+        setError('Failed to delete stock item.')
+      }
+    }
   }
 
   async function logManualMovement() {
@@ -209,10 +225,16 @@ export default function Stock() {
                     <h3 className="font-semibold text-slate-800">{s.products?.name}</h3>
                     <p className="text-xs text-slate-400">{s.products?.category}</p>
                   </div>
-                  <button onClick={() => setShowHistory(showHistory === s.id ? null : s.id)}
-                    className="flex items-center gap-1 text-xs text-slate-400 hover:text-sky-500 px-2 py-1 rounded-lg hover:bg-sky-50 transition-colors">
-                    <History size={13} /> History
-                  </button>
+                  <div className="flex gap-1">
+                    <button onClick={() => setShowHistory(showHistory === s.id ? null : s.id)}
+                      className="flex items-center gap-1 text-xs text-slate-400 hover:text-sky-500 px-2 py-1 rounded-lg hover:bg-sky-50 transition-colors">
+                      <History size={13} /> History
+                    </button>
+                    <button onClick={() => removeStockItem(s.id)}
+                      className="flex items-center gap-1 text-xs text-slate-400 hover:text-red-500 px-2 py-1 rounded-lg hover:bg-red-50 transition-colors">
+                      <Trash2 size={13} /> Delete
+                    </button>
+                  </div>
                 </div>
 
                 <div className="grid grid-cols-3 gap-3 mb-3">
@@ -253,6 +275,54 @@ export default function Stock() {
                     </span>
                   </div>
                 </div>
+
+                {/* Composite Product Assembly Stock Visualization */}
+                {(() => {
+                  const parentAssemblies = assemblies.filter(a => a.parent_product_id === s.product_id)
+                  const isComposite = parentAssemblies.length > 0
+                  if (!isComposite) return null
+
+                  let maxAssembleable = Infinity
+                  parentAssemblies.forEach(a => {
+                    const childStockRow = stock.find(st => st.product_id === a.child_product_id)
+                    const childAvail = childStockRow?.quantity_available || 0
+                    const possible = Math.floor(childAvail / (a.quantity || 1))
+                    if (possible < maxAssembleable) {
+                      maxAssembleable = possible
+                    }
+                  })
+                  if (maxAssembleable === Infinity) maxAssembleable = 0
+
+                  return (
+                    <div className="mt-3 pt-3 border-t border-slate-100 bg-slate-50/60 rounded-xl p-3 space-y-2">
+                      <div className="flex items-center justify-between">
+                        <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">
+                          🧩 Composite Parts Stock
+                        </p>
+                        <span className={`text-[10px] px-2 py-0.5 rounded-full font-bold
+                          ${maxAssembleable > 0 ? 'bg-emerald-100 text-emerald-700' : 'bg-red-100 text-red-700'}`}>
+                          📦 Buildable: {maxAssembleable} {maxAssembleable === 1 ? 'unit' : 'units'}
+                        </span>
+                      </div>
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs">
+                        {parentAssemblies.map((a, idx) => {
+                          const childProd = products.find(p => p.id === a.child_product_id)
+                          const childStockRow = stock.find(st => st.product_id === a.child_product_id)
+                          const childAvail = childStockRow?.quantity_available || 0
+                          const isShort = childAvail < (a.quantity || 1)
+                          return (
+                            <div key={idx} className="flex justify-between items-center bg-white border border-slate-100 rounded-lg p-2 shadow-sm">
+                              <span className="font-medium text-slate-600 truncate max-w-[120px]">{childProd?.name || 'Unknown part'}</span>
+                              <span className={`font-semibold ${isShort ? 'text-red-500' : 'text-slate-700'}`}>
+                                {childAvail} <span className="text-slate-400 font-normal">/ {a.quantity} req</span>
+                              </span>
+                            </div>
+                          )
+                        })}
+                      </div>
+                    </div>
+                  )
+                })()}
 
                 {/* Movement history */}
                 {showHistory === s.id && (

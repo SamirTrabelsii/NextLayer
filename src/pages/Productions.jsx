@@ -55,6 +55,8 @@ export default function Productions() {
     const [form, setForm] = useState(emptyForm)
     const [editing, setEditing] = useState(null)
     const [deleting, setDeleting] = useState(null)
+    const [splitting, setSplitting] = useState(null)
+    const [splitParts, setSplitParts] = useState([{ description: '', quantity: 1 }])
     const [saving, setSaving] = useState(false)
     const [advancing, setAdvancing] = useState(null) // id of production being advanced
 
@@ -204,6 +206,51 @@ export default function Productions() {
         }
     }
 
+    
+    // ─── SPLIT JOB ────────────────────────────────────────────────
+    function openSplit(p) {
+        setSplitting(p)
+        setSplitParts([{ description: '', quantity: 1 }, { description: '', quantity: 1 }])
+    }
+
+    async function handleSplit() {
+        if (!splitting) return
+        setSaving(true)
+        setError('')
+        try {
+            const validParts = splitParts.filter(p => p.description.trim() !== '')
+            if (validParts.length < 2) {
+                setError('Please provide at least 2 parts to split this job into.')
+                setSaving(false)
+                return
+            }
+
+            const newJobs = validParts.map(part => ({
+                order_id: splitting.order_id,
+                product_id: null,
+                description: part.description,
+                quantity: part.quantity || 1,
+                status: 'queued',
+                material: splitting.material || 'PLA',
+                notes: `[Split from: ${splitting.products?.name || splitting.description}]`
+            }))
+
+            const { error: insertErr } = await supabase.from('productions').insert(newJobs)
+            if (insertErr) throw insertErr
+
+            const { error: delErr } = await supabase.from('productions').delete().eq('id', splitting.id)
+            if (delErr) throw delErr
+
+            setSplitting(null)
+            fetchAll()
+        } catch (err) {
+            console.error('Split error:', err)
+            setError(err.message || 'Failed to split job.')
+        } finally {
+            setSaving(false)
+        }
+    }
+
     // ─── SAVE ───────────────────────────────────────────────────
     async function saveProd() {
         if (!form.description && !form.product_id) return
@@ -325,10 +372,11 @@ export default function Productions() {
                     }
                 }
 
-                // 2. Sync product production_cost if actual_cost known
+                                // 2. Sync product production_cost if actual_cost known
                 if (prod.product_id && prod.actual_cost) {
+                    const unitCost = prod.actual_cost / (parseInt(prod.quantity) || 1)
                     await supabase.from('products')
-                        .update({ production_cost: prod.actual_cost })
+                        .update({ production_cost: unitCost })
                         .eq('id', prod.product_id)
                         
                     // ALSO update any parent products that use this product as an assembly
@@ -377,18 +425,54 @@ export default function Productions() {
                     }])
                 }
 
-                // 3b. Has order → advance order to 'ready'
+                                // 3b. Has order -> auto-advance to 'ready' IF all jobs are done and stock is fulfilled
                 if (prod.order_id) {
-                    const { data: order } = await supabase
-                        .from('orders')
-                        .select('status')
-                        .eq('id', prod.order_id)
-                        .single()
+                    // If it was a stock job spawned for this order, fulfill the item directly
+                    if (prod.product_id && prod.order_item_id) {
+                        const qty = parseInt(prod.quantity) || 1
+                        const { data: oItem } = await supabase.from('order_items').select('fulfilled_quantity').eq('id', prod.order_item_id).single()
+                        if (oItem) {
+                            await supabase.from('order_items').update({
+                                fulfilled_quantity: (oItem.fulfilled_quantity || 0) + qty
+                            }).eq('id', prod.order_item_id)
+                            
+                            // Log the stock movement as produced then sold
+                            await supabase.from('stock_movements').insert([{
+                                product_id: prod.product_id, type: 'produced', quantity: qty, is_positive: true, notes: `Produced for order`
+                            }, {
+                                product_id: prod.product_id, type: 'sold', quantity: qty, is_positive: false, order_id: prod.order_id, notes: `Fulfilled standard item`
+                            }])
+                        }
+                    }
+
+                    // Check if order is in production
+                    const { data: order } = await supabase.from('orders')
+                        .select('status, order_items(id, quantity, fulfilled_quantity, is_custom, custom_description, product_id)')
+                        .eq('id', prod.order_id).single()
 
                     if (order?.status === 'in_production') {
-                        await supabase.from('orders')
-                            .update({ status: 'ready' })
-                            .eq('id', prod.order_id)
+                        // Check ALL sibling production jobs for this order
+                        const { data: siblings } = await supabase.from('productions')
+                            .select('id, status')
+                            .eq('order_id', prod.order_id)
+                            
+                        // Also wait for this current job to be 'done' in the check, since we haven't updated db yet
+                        const allJobsDone = (siblings || []).every(s => (s.id === prod.id ? true : s.status === 'done'))
+                        
+                        // Check if standard items are fulfilled
+                        const allStandardFulfilled = (order.order_items || [])
+                            .filter(i => i.product_id && !i.is_custom)
+                            .every(i => {
+                                // If the current prod job is fulfilling this item, simulate the addition
+                                const simulatedFulfilled = i.id === prod.order_item_id 
+                                    ? (i.fulfilled_quantity || 0) + (parseInt(prod.quantity) || 1) 
+                                    : (i.fulfilled_quantity || 0)
+                                return simulatedFulfilled >= (i.quantity || 1)
+                            })
+                            
+                        if (allJobsDone && allStandardFulfilled) {
+                            await supabase.from('orders').update({ status: 'ready' }).eq('id', prod.order_id)
+                        }
                     }
                 }
             }
@@ -567,183 +651,240 @@ export default function Productions() {
                     <p className="text-slate-400 text-sm">Create a new print job to get started</p>
                 </div>
             ) : (
-                <div className="flex flex-col gap-3">
-                    {filtered.map(p => {
-                        const s = si(p.status)
-                        const next = getNext(p.status)
-                        const nextSI = next ? si(next) : null
-                        const isActive = advancing === p.id
-                        const flowIdx = FLOW.indexOf(p.status)
+                <div className="flex flex-col gap-6">
+                    {(() => {
+                        // 1. Group data: Order -> Item -> Jobs
+                        const ordersMap = new Map()
+                        const standaloneJobs = []
 
-                        return (
-                            <div key={p.id} className="bg-white rounded-2xl border border-slate-100 shadow-sm">
-                                <div className="p-4">
+                        for (const p of filtered) {
+                            if (p.order_id) {
+                                if (!ordersMap.has(p.order_id)) {
+                                    ordersMap.set(p.order_id, {
+                                        order_id: p.order_id,
+                                        order: p.orders,
+                                        itemsMap: new Map()
+                                    })
+                                }
+                                
+                                const orderGroup = ordersMap.get(p.order_id)
+                                const itemId = p.order_item_id || 'unlinked'
+                                
+                                if (!orderGroup.itemsMap.has(itemId)) {
+                                    orderGroup.itemsMap.set(itemId, {
+                                        order_item_id: itemId,
+                                        order_item: p.order_items,
+                                        jobs: []
+                                    })
+                                }
+                                
+                                orderGroup.itemsMap.get(itemId).jobs.push(p)
+                            } else {
+                                standaloneJobs.push(p)
+                            }
+                        }
 
-                                    {/* Top row */}
-                                    <div className="flex items-start justify-between mb-3">
-                                        <div className="flex-1 min-w-0">
-                                            <div className="flex items-center gap-2 flex-wrap mb-1">
-                                                <span className={`text-xs font-semibold px-2 py-0.5 rounded-full ${s.color}`}>
-                                                    {s.emoji} {s.label}
-                                                </span>
-                                                {p.material && (
-                                                    <span className="text-xs px-2 py-0.5 rounded-full bg-slate-100 text-slate-500">
-                                                        {p.material}
-                                                    </span>
-                                                )}
-                                                {p.color && (
-                                                    <span className="text-xs px-2 py-0.5 rounded-full bg-slate-100 text-slate-500">
-                                                        {p.color}
-                                                    </span>
-                                                )}
-                                                {!p.order_id && (
-                                                    <span className="text-xs px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-600">
-                                                        📦 For stock
-                                                    </span>
-                                                )}
-                                            </div>
-                                            <h3 className="font-semibold text-slate-800">
-                                                {p.products?.name || p.description || 'Custom job'}
-                                                {(p.quantity || 1) > 1 && (
-                                                    <span className="text-slate-400 font-normal text-sm"> ×{p.quantity}</span>
-                                                )}
-                                            </h3>
-                                            {p.orders?.clients?.name && (
-                                                <p className="text-xs text-slate-400 mt-0.5">
-                                                    📋 Order: {p.orders.clients.name}
-                                                </p>
-                                            )}
-                                        </div>
+                        // Helper for derived status
+                        function getAggregateStatus(jobs) {
+                            if (jobs.some(j => j.status === 'failed')) return 'failed'
+                            if (jobs.every(j => j.status === 'done')) return 'done'
+                            if (jobs.some(j => j.status === 'printing')) return 'printing'
+                            return 'queued'
+                        }
 
-                                        <div className="flex gap-1 ml-2 flex-shrink-0">
-                                            <button onClick={() => openEdit(p)}
-                                                className="p-1.5 text-slate-400 hover:text-sky-500 hover:bg-sky-50 rounded-lg transition-colors text-sm">
-                                                ✏️
-                                            </button>
-                                            <button onClick={() => setDeleting(p)}
-                                                className="p-1.5 text-slate-400 hover:text-red-500 hover:bg-red-50 rounded-lg transition-colors">
-                                                <Trash2 size={14} />
-                                            </button>
-                                        </div>
-                                    </div>
+                        function renderJobCard(p) {
+                            const s = si(p.status)
+                            const next = getNext(p.status)
+                            const isActive = advancing === p.id
+                            const flowIdx = FLOW.indexOf(p.status)
 
-                                    {/* Filament breakdown — from .3mf if available, otherwise simple display */}
-                                    {p.filament_data?.length > 0 ? (
-                                        <div className="flex flex-wrap gap-1.5 py-2.5 border-t border-b border-slate-50 mb-3">
-                                            {p.filament_data.map((f, i) => (
-                                                <div key={i} className="flex items-center gap-1.5 bg-slate-50 rounded-lg px-2 py-1">
-                                                    <span className="w-3 h-3 rounded-sm flex-shrink-0 border border-white shadow-sm"
-                                                        style={{ backgroundColor: f.is_support ? '#cbd5e1' : (f.color_hex || '#888') }} />
-                                                    <span className="text-xs text-slate-600 font-medium">
-                                                        {f.grams.toFixed(1)}g
+                            return (
+                                <div key={p.id} className="bg-white rounded-2xl border border-slate-100 shadow-sm flex flex-col">
+                                    <div className="p-4 flex-1">
+                                        <div className="flex items-start justify-between mb-3">
+                                            <div className="flex-1 min-w-0">
+                                                <div className="flex items-center gap-2 flex-wrap mb-1">
+                                                    <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full uppercase tracking-wider ${s.color}`}>
+                                                        {s.label}
                                                     </span>
-                                                    {f.cost_tnd && (
-                                                        <span className="text-xs text-slate-400">{(f.cost_tnd).toFixed(2)} TND</span>
+                                                    {p.material && (
+                                                        <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-slate-100 text-slate-500 uppercase tracking-wider">
+                                                            {p.material}
+                                                        </span>
+                                                    )}
+                                                    {p.color && (
+                                                        <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-slate-100 text-slate-500 uppercase tracking-wider">
+                                                            {p.color}
+                                                        </span>
                                                     )}
                                                 </div>
-                                            ))}
-                                            {(p.print_time_hours || p.actual_cost) && (
-                                                <>
-                                                    {p.print_time_hours && (
-                                                        <div className="flex items-center gap-1 bg-slate-50 rounded-lg px-2 py-1">
-                                                            <span className="text-xs text-slate-400">⏱</span>
-                                                            <span className="text-xs text-slate-600 font-medium">{p.print_time_hours}h</span>
-                                                        </div>
+                                                <h3 className="font-semibold text-slate-800 text-sm leading-tight mt-1.5">
+                                                    {p.products?.name || p.description || 'Custom part'}
+                                                    {(p.quantity || 1) > 1 && (
+                                                        <span className="text-slate-400 font-normal ml-1">×{p.quantity}</span>
                                                     )}
-                                                    {p.actual_cost && (
-                                                        <div className="flex items-center gap-1 bg-sky-50 rounded-lg px-2 py-1">
-                                                            <span className="text-xs font-bold text-sky-700">{p.actual_cost} TND</span>
+                                                </h3>
+                                            </div>
+                                            <div className="flex gap-1 ml-2 flex-shrink-0">
+                                                <button onClick={() => openSplit(p)} className="p-1 text-slate-400 hover:text-violet-500 bg-slate-50 hover:bg-violet-50 rounded-lg transition-colors" title="Split into parts">
+                                                    🧩
+                                                </button>
+                                                <button onClick={() => openEdit(p)} className="p-1 text-slate-400 hover:text-sky-500 bg-slate-50 hover:bg-sky-50 rounded-lg transition-colors">
+                                                    ✏️
+                                                </button>
+                                                <button onClick={() => setDeleting(p)} className="p-1 text-slate-400 hover:text-red-500 bg-slate-50 hover:bg-red-50 rounded-lg transition-colors">
+                                                    <Trash2 size={14} />
+                                                </button>
+                                            </div>
+                                        </div>
+
+                                        {p.filament_data?.length > 0 ? (
+                                            <div className="flex flex-wrap gap-1.5 py-2 border-t border-slate-50 mb-3">
+                                                {p.filament_data.map((f, i) => (
+                                                    <div key={i} className="flex items-center gap-1.5 bg-slate-50 rounded px-1.5 py-0.5">
+                                                        <span className="w-2.5 h-2.5 rounded-sm flex-shrink-0 shadow-sm"
+                                                            style={{ backgroundColor: f.is_support ? '#cbd5e1' : (f.color_hex || '#888') }} />
+                                                        <span className="text-[10px] text-slate-600 font-medium">
+                                                            {f.grams.toFixed(1)}g
+                                                        </span>
+                                                    </div>
+                                                ))}
+                                                {(p.print_time_hours || p.actual_cost) && (
+                                                    <>
+                                                        {p.print_time_hours && <span className="text-[10px] text-slate-500 bg-slate-50 px-1.5 py-0.5 rounded">⏱ {p.print_time_hours}h</span>}
+                                                        {p.actual_cost && <span className="text-[10px] font-bold text-sky-700 bg-sky-50 px-1.5 py-0.5 rounded">{p.actual_cost} TND</span>}
+                                                    </>
+                                                )}
+                                            </div>
+                                        ) : (p.filament_grams || p.print_time_hours || p.actual_cost) ? (
+                                            <div className="flex flex-wrap gap-2 text-xs py-2 border-t border-slate-50 mb-3">
+                                                {p.filament_grams && <span className="text-slate-500 text-[10px] bg-slate-50 px-1.5 py-0.5 rounded">🧵 {p.filament_grams}g</span>}
+                                                {p.print_time_hours && <span className="text-slate-500 text-[10px] bg-slate-50 px-1.5 py-0.5 rounded">⏱ {p.print_time_hours}h</span>}
+                                                {p.actual_cost && <span className="font-bold text-sky-700 text-[10px] bg-sky-50 px-1.5 py-0.5 rounded">{p.actual_cost} TND</span>}
+                                            </div>
+                                        ) : null}
+
+                                        {p.status !== 'failed' && (
+                                            <div className="flex gap-0.5 mb-2 mt-auto">
+                                                {FLOW.map((key, idx) => (
+                                                    <div key={key} className={`h-1 flex-1 rounded-full transition-colors ${idx <= flowIdx ? si(key).dot : 'bg-slate-100'}`} />
+                                                ))}
+                                            </div>
+                                        )}
+                                    </div>
+
+                                    <div className="p-2 border-t border-slate-50 space-y-1.5 bg-slate-50/50 rounded-b-2xl">
+                                        {next && p.status !== 'failed' && (
+                                            <button
+                                                onClick={() => advanceProduction(p)}
+                                                disabled={!!advancing}
+                                                className={`w-full py-1.5 rounded-lg text-xs font-bold transition-all border
+                                                    ${next === 'done' ? 'bg-emerald-500 hover:bg-emerald-600 text-white border-emerald-500' :
+                                                      next === 'printing' ? 'bg-yellow-400 hover:bg-yellow-500 text-white border-yellow-400' :
+                                                      'bg-white hover:bg-sky-50 text-slate-600 border-slate-200'}`}>
+                                                {isActive ? '...' : (next === 'printing' ? 'Start Print' : 'Mark Done')}
+                                            </button>
+                                        )}
+                                        {['queued', 'printing'].includes(p.status) && (
+                                            <button onClick={() => markFailed(p)} disabled={!!advancing}
+                                                className="w-full py-1 rounded-lg text-[10px] font-bold text-red-400 hover:text-red-600 hover:bg-red-50 uppercase tracking-wider">
+                                                Mark Failed
+                                            </button>
+                                        )}
+                                        {p.status === 'failed' && (
+                                            <button onClick={async () => {
+                                                setAdvancing(p.id); await supabase.from('productions').update({ status: 'queued' }).eq('id', p.id); await fetchAll(); setAdvancing(null)
+                                            }} disabled={!!advancing}
+                                                className="w-full py-1.5 rounded-lg text-xs font-bold bg-white text-slate-600 border border-slate-200 hover:bg-slate-50">
+                                                Retry Job
+                                            </button>
+                                        )}
+                                    </div>
+                                </div>
+                            )
+                        }
+
+                        return (
+                            <>
+                                {Array.from(ordersMap.values()).map(orderGroup => {
+                                    // Aggregate status across ALL items in this order
+                                    const allJobsInOrder = Array.from(orderGroup.itemsMap.values()).flatMap(i => i.jobs)
+                                    const orderAggStatus = getAggregateStatus(allJobsInOrder)
+                                    const oSi = si(orderAggStatus)
+
+                                    return (
+                                        <div key={orderGroup.order_id} className="bg-slate-50 rounded-3xl border border-slate-200 p-4 sm:p-6 shadow-sm mb-6">
+                                            {/* Order Header */}
+                                            <div className="flex items-center justify-between mb-5">
+                                                <div>
+                                                    <h2 className="text-xl font-bold text-slate-800 flex items-center gap-2">
+                                                        <span>📋</span>
+                                                        Order: {orderGroup.order?.clients?.name || 'Unknown Client'}
+                                                    </h2>
+                                                    <p className="text-sm text-slate-500 ml-7 mt-0.5 font-medium">
+                                                        {orderGroup.order?.custom_description || 'Standard Order'}
+                                                    </p>
+                                                </div>
+                                                <div className={`px-3 py-1 rounded-full text-xs font-bold ${oSi.color} bg-white shadow-sm`}>
+                                                    {oSi.emoji} {orderAggStatus.toUpperCase()}
+                                                </div>
+                                            </div>
+
+                                            <div className="space-y-4">
+                                                {Array.from(orderGroup.itemsMap.values()).map(itemGroup => {
+                                                    const itemAggStatus = getAggregateStatus(itemGroup.jobs)
+                                                    const iSi = si(itemAggStatus)
+
+                                                    return (
+                                                        <div key={itemGroup.order_item_id} className="bg-white rounded-2xl border border-slate-200 p-4 shadow-sm">
+                                                            {/* Item Header */}
+                                                            <div className="flex items-center justify-between mb-4">
+                                                                <h3 className="font-semibold text-slate-700 flex items-center gap-2">
+                                                                    <span className="text-lg">📦</span>
+                                                                    {itemGroup.order_item?.custom_description || itemGroup.order_item?.products?.name || 'Linked Item'}
+                                                                    {itemGroup.order_item?.is_composite && (
+                                                                        <span className="text-[10px] bg-violet-100 text-violet-700 px-2 py-0.5 rounded-md uppercase font-bold tracking-wider ml-2">
+                                                                            Composite
+                                                                        </span>
+                                                                    )}
+                                                                </h3>
+                                                                <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full border ${iSi.color} border-current opacity-70`}>
+                                                                    {iSi.label}
+                                                                </span>
+                                                            </div>
+
+                                                            {/* Jobs Grid */}
+                                                            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+                                                                {itemGroup.jobs.map(job => renderJobCard(job))}
+                                                            </div>
                                                         </div>
-                                                    )}
-                                                </>
-                                            )}
+                                                    )
+                                                })}
+                                            </div>
                                         </div>
-                                    ) : (p.filament_grams || p.print_time_hours || p.actual_cost) ? (
-                                        <div className="flex flex-wrap gap-4 text-sm py-2.5 border-t border-b border-slate-50 mb-3">
-                                            {p.filament_grams && <span className="text-slate-600 text-xs">🧵 {p.filament_grams}g</span>}
-                                            {p.print_time_hours && <span className="text-slate-600 text-xs">⏱ {p.print_time_hours}h</span>}
-                                            {p.actual_cost && <span className="font-bold text-sky-700 text-xs">{p.actual_cost} TND</span>}
+                                    )
+                                })}
+
+                                {/* Standalone Stock Jobs */}
+                                {standaloneJobs.length > 0 && (
+                                    <div className="bg-emerald-50 rounded-3xl border border-emerald-100 p-4 sm:p-6 shadow-sm">
+                                        <div className="mb-5">
+                                            <h2 className="text-xl font-bold text-emerald-800 flex items-center gap-2">
+                                                <span>🏭</span>
+                                                Stock Productions
+                                            </h2>
+                                            <p className="text-sm text-emerald-600/80 ml-7 mt-0.5 font-medium">
+                                                Unlinked print jobs for inventory
+                                            </p>
                                         </div>
-                                    ) : null}
-
-                                    {/* Progress bar */}
-                                    {p.status !== 'failed' && (
-                                        <div className="flex gap-1 mb-3">
-                                            {FLOW.map((key, idx) => (
-                                                <div key={key}
-                                                    className={`h-1 flex-1 rounded-full transition-colors
-                            ${idx <= flowIdx ? si(key).dot : 'bg-slate-100'}`} />
-                                            ))}
+                                        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+                                            {standaloneJobs.map(job => renderJobCard(job))}
                                         </div>
-                                    )}
-
-                                    {/* Notes */}
-                                    {p.notes && (
-                                        <p className="text-xs text-slate-400 italic mb-3">"{p.notes}"</p>
-                                    )}
-
-                                    {/* Done message */}
-                                    {p.status === 'done' && (
-                                        <div className="text-xs text-emerald-600 font-medium mb-3">
-                                            {p.order_id ? '✅ Order advanced to Ready' : '✅ Added to stock'}
-                                        </div>
-                                    )}
-                                </div>
-
-                                {/* Action buttons */}
-                                <div className="px-4 pb-4 space-y-2">
-
-                                    {/* Primary: advance to next */}
-                                    {next && p.status !== 'failed' && (
-                                        <button
-                                            onClick={() => advanceProduction(p)}
-                                            disabled={!!advancing}
-                                            className={`w-full py-2.5 rounded-xl text-sm font-semibold flex items-center justify-center gap-2 transition-all border
-                        ${next === 'done'
-                                                    ? 'bg-emerald-500 hover:bg-emerald-600 text-white border-emerald-500 shadow-sm'
-                                                    : next === 'printing'
-                                                        ? 'bg-yellow-400 hover:bg-yellow-500 text-white border-yellow-400 shadow-sm'
-                                                        : 'bg-slate-50 hover:bg-sky-50 hover:text-sky-600 border-slate-200 hover:border-sky-200 text-slate-600'}
-                        disabled:opacity-50`}>
-                                            {isActive ? (
-                                                <span className="animate-pulse">Updating...</span>
-                                            ) : (
-                                                <>
-                                                    <ArrowRight size={15} />
-                                                    {next === 'printing' ? '🖨️ Start Printing' : '✅ Mark as Done'}
-                                                </>
-                                            )}
-                                        </button>
-                                    )}
-
-                                    {/* Secondary: mark as failed (only when active) */}
-                                    {['queued', 'printing'].includes(p.status) && (
-                                        <button
-                                            onClick={() => markFailed(p)}
-                                            disabled={!!advancing}
-                                            className="w-full py-2 rounded-xl text-xs font-medium text-red-400 hover:text-red-600 hover:bg-red-50 border border-transparent hover:border-red-200 transition-all disabled:opacity-50">
-                                            ❌ Mark as failed
-                                        </button>
-                                    )}
-
-                                    {/* Retry from failed */}
-                                    {p.status === 'failed' && (
-                                        <button
-                                            onClick={async () => {
-                                                setAdvancing(p.id)
-                                                await supabase.from('productions').update({ status: 'queued' }).eq('id', p.id)
-                                                await fetchAll()
-                                                setAdvancing(null)
-                                            }}
-                                            disabled={!!advancing}
-                                            className="w-full py-2.5 rounded-xl text-sm font-semibold bg-slate-100 hover:bg-slate-200 text-slate-600 border border-slate-200 transition-all disabled:opacity-50">
-                                            🔄 Retry — Back to Queue
-                                        </button>
-                                    )}
-                                </div>
-                            </div>
+                                    </div>
+                                )}
+                            </>
                         )
-                    })}
+                    })()}
                 </div>
             )}
 
