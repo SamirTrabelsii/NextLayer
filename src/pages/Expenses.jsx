@@ -25,6 +25,7 @@ const empty = {
 
 export default function Expenses() {
     const [expenses, setExpenses] = useState([])
+    const [walletOrders, setWalletOrders] = useState([])
     const [members, setMembers] = useState([])
     const [loading, setLoading] = useState(true)
     const [showModal, setShowModal] = useState(false)
@@ -38,6 +39,7 @@ export default function Expenses() {
 
     useEffect(() => {
         fetchExpenses()
+        fetchWalletOrders()
         fetchMembers()
     }, [])
 
@@ -49,6 +51,14 @@ export default function Expenses() {
             .order('date', { ascending: false })
         setExpenses(data || [])
         setLoading(false)
+    }
+
+    async function fetchWalletOrders() {
+        const { data } = await supabase
+            .from('orders')
+            .select('payment_reference, total_price')
+            .eq('payment_method', 'founder_wallet')
+        setWalletOrders(data || [])
     }
 
     async function fetchMembers() {
@@ -158,18 +168,40 @@ export default function Expenses() {
 
     const catInfo = (key) => CATEGORIES.find(c => c.key === key) || CATEGORIES[4]
 
-    // Stats by Member
+    // Stats by Member (Including Founder Wallet)
     const byMemberDict = {}
     filtered.forEach(e => {
         if (e.paid_by && Array.isArray(e.paid_by)) {
             e.paid_by.forEach(p => {
                 if (!byMemberDict[p.member_id]) {
-                    byMemberDict[p.member_id] = { id: p.member_id, name: p.name || 'Unknown', total: 0 }
+                    byMemberDict[p.member_id] = { id: p.member_id, name: p.name || 'Unknown', total: 0, consumed: 0, remaining: 0 }
                 }
                 byMemberDict[p.member_id].total += p.amount || 0
             })
         }
     })
+    
+    // Add wallet consumption (only for all-time, or you can filter it by date too, but wallet is usually lifetime balance)
+    walletOrders.forEach(wo => {
+        if (wo.payment_reference) {
+            if (!byMemberDict[wo.payment_reference]) {
+                byMemberDict[wo.payment_reference] = { 
+                    id: wo.payment_reference, 
+                    name: members.find(m => m.id === wo.payment_reference)?.full_name || 'Unknown', 
+                    total: 0, 
+                    consumed: 0, 
+                    remaining: 0 
+                }
+            }
+            byMemberDict[wo.payment_reference].consumed += (wo.total_price || 0)
+        }
+    })
+    
+    // Calculate remaining
+    Object.values(byMemberDict).forEach(m => {
+        m.remaining = m.total - m.consumed
+    })
+    
     const byMember = Object.values(byMemberDict).sort((a, b) => b.total - a.total)
 
     // Group by date
@@ -244,22 +276,45 @@ export default function Expenses() {
 
             {/* Member breakdown */}
             {byMember.length > 0 && (
-                <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 mb-5">
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3 mb-5">
                     {byMember.map(m => (
-                        <button key={m.id}
-                            onClick={() => setFilterMember(filterMember === m.id ? 'all' : m.id)}
-                            className={`bg-white rounded-xl border p-3 text-left transition-all
-                ${filterMember === m.id ? 'ring-2 ring-purple-400 border-purple-200' : 'border-slate-100 hover:bg-slate-50'}`}>
-                            <div className="flex items-center justify-between mb-1">
-                                <span className="text-lg">👤</span>
-                                <span className="text-xs font-medium px-2 py-0.5 rounded-full bg-slate-100 text-slate-600 truncate max-w-[100px]">{m.name}</span>
+                        <div key={m.id}
+                            className={`bg-white rounded-xl border p-4 text-left transition-all relative overflow-hidden
+                ${filterMember === m.id ? 'ring-2 ring-purple-400 border-purple-200' : 'border-slate-200 hover:border-purple-300'}`}>
+                            <div className="flex items-center justify-between mb-3">
+                                <div className="flex items-center gap-2">
+                                    <span className="text-xl">👤</span>
+                                    <span className="font-bold text-slate-700">{m.name}</span>
+                                </div>
+                                <button onClick={() => setFilterMember(filterMember === m.id ? 'all' : m.id)}
+                                        className={`text-xs px-2 py-1 rounded-lg font-medium transition-colors ${filterMember === m.id ? 'bg-purple-100 text-purple-700' : 'bg-slate-100 hover:bg-slate-200 text-slate-600'}`}>
+                                    {filterMember === m.id ? 'Clear Filter' : 'Filter'}
+                                </button>
                             </div>
-                            <p className="font-bold text-slate-800">{m.total.toFixed(2)} TND</p>
-                            <div className="mt-1.5 bg-slate-100 rounded-full h-1">
-                                <div className="h-1 rounded-full bg-purple-400"
-                                    style={{ width: `${Math.min((m.total / totalFiltered) * 100, 100)}%` }} />
+                            
+                            <div className="grid grid-cols-2 gap-2 mb-3">
+                                <div className="bg-slate-50 p-2 rounded-lg border border-slate-100">
+                                    <p className="text-[10px] font-semibold text-slate-500 uppercase">Contributed</p>
+                                    <p className="font-bold text-slate-700">{m.total.toFixed(2)}</p>
+                                </div>
+                                <div className="bg-orange-50 p-2 rounded-lg border border-orange-100">
+                                    <p className="text-[10px] font-semibold text-orange-600 uppercase">Consumed</p>
+                                    <p className="font-bold text-orange-700">-{m.consumed.toFixed(2)}</p>
+                                </div>
                             </div>
-                        </button>
+                            
+                            <div className="bg-purple-50 p-2 rounded-lg border border-purple-100 flex justify-between items-center">
+                                <p className="text-xs font-bold text-purple-800">Wallet Balance</p>
+                                <p className="font-black text-purple-700">{m.remaining.toFixed(2)} <span className="text-[10px]">TND</span></p>
+                            </div>
+                            
+                            {m.total > 0 && (
+                                <div className="mt-3 bg-slate-100 rounded-full h-1.5 overflow-hidden">
+                                    <div className="h-full rounded-full bg-purple-500"
+                                        style={{ width: `${Math.min((m.total / totalFiltered) * 100, 100)}%` }} />
+                                </div>
+                            )}
+                        </div>
                     ))}
                 </div>
             )}

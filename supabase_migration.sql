@@ -78,3 +78,10 @@ ALTER TABLE public.productions ADD COLUMN IF NOT EXISTS order_item_id UUID REFER
 
 -- 9. Reload PostgREST schema cache so the API can see the new columns instantly
 NOTIFY pgrst, 'reload schema';
+
+-- 10. Add payment tracking for Founder Wallet
+ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS payment_method TEXT DEFAULT 'cash';
+ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS payment_reference TEXT;
+
+-- 11. Reload again
+NOTIFY pgrst, 'reload schema';

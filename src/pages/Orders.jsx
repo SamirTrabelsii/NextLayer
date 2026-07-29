@@ -77,6 +77,7 @@ export default function Orders() {
     const [orders, setOrders] = useState([])
     const [clients, setClients] = useState([])
     const [products, setProducts] = useState([])
+    const [profiles, setProfiles] = useState([])
     const [loading, setLoading] = useState(true)
     const [error, setError] = useState('')
 
@@ -129,6 +130,8 @@ export default function Orders() {
     const [showPaidDateModal, setShowPaidDateModal] = useState(false)
     const [pendingPaidOrder, setPendingPaidOrder] = useState(null)
     const [paidDateOverride, setPaidDateOverride] = useState('')
+    const [paymentMethod, setPaymentMethod] = useState('cash')
+    const [paymentReference, setPaymentReference] = useState('')
     const [confirmingPaidDate, setConfirmingPaidDate] = useState(false)
 
     // Custom Job Configurator Modal — intercepts the → In Production transition
@@ -384,7 +387,7 @@ export default function Orders() {
         setLoading(true)
         setError('')
         try {
-            const [{ data: o, error: e1 }, { data: c }, { data: p }] = await Promise.all([
+            const [{ data: o, error: e1 }, { data: c }, { data: p }, { data: pr }] = await Promise.all([
                 supabase.from('orders').select(`
           id, type, status, total_price, is_paid, paid_at, deadline, notes,
           custom_description, dimensions, reference_notes, reference_image_url, stl_url, created_at,
@@ -394,11 +397,13 @@ export default function Orders() {
         `).order('created_at', { ascending: false }),
                 supabase.from('clients').select('id, name, phone').order('name'),
                 supabase.from('products').select('id, name, selling_price, category, product_type').eq('is_active', true).order('name'),
+                supabase.from('profiles').select('id, full_name').order('full_name'),
             ])
             if (e1) throw e1
             setOrders(o ?? [])
             setClients(c ?? [])
             setProducts(p ?? [])
+            setProfiles(pr ?? [])
         } catch (err) {
             setError('Failed to load orders. Please refresh.')
             console.error(err)
@@ -932,9 +937,15 @@ export default function Orders() {
             const chosenDate = paidDateOverride
                 ? new Date(paidDateOverride).toISOString()
                 : new Date().toISOString()
-            await applyStatusChange(pendingPaidOrder, 'paid', { paidAt: chosenDate })
+            await applyStatusChange(pendingPaidOrder, 'paid', { 
+                paidAt: chosenDate,
+                paymentMethod,
+                paymentReference: paymentMethod === 'founder_wallet' ? paymentReference : null
+            })
             setShowPaidDateModal(false)
             setPendingPaidOrder(null)
+            setPaymentMethod('cash')
+            setPaymentReference('')
         } finally {
             setConfirmingPaidDate(false)
         }
@@ -1290,7 +1301,11 @@ async function saveOrder() {
                     status: next,
                     is_paid: next === 'paid',
                     // Use caller-supplied paidAt if provided (backdated orders), else now
-                    ...(next === 'paid' ? { paid_at: options.paidAt ?? new Date().toISOString() } : {}),
+                    ...(next === 'paid' ? { 
+                        paid_at: options.paidAt ?? new Date().toISOString(),
+                        payment_method: options.paymentMethod ?? 'cash',
+                        payment_reference: options.paymentReference ?? null
+                    } : {}),
                 })
                 .eq('id', order.id)
 
@@ -3714,6 +3729,38 @@ async function fulfillStandardItem(item) {
                                     className="w-full border-2 border-slate-200 focus:border-sky-400 rounded-xl px-3 py-2.5 text-sm outline-none transition-colors"
                                 />
                             </div>
+                            
+                            <div>
+                                <label className="text-xs font-semibold text-slate-700 block mb-1.5">Payment Method *</label>
+                                <select 
+                                    value={paymentMethod}
+                                    onChange={e => {
+                                        setPaymentMethod(e.target.value)
+                                        if (e.target.value !== 'founder_wallet') setPaymentReference('')
+                                    }}
+                                    className="w-full border-2 border-slate-200 focus:border-sky-400 rounded-xl px-3 py-2.5 text-sm outline-none bg-white transition-colors">
+                                    <option value="cash">💵 Cash / Transfer / Card</option>
+                                    <option value="founder_wallet">💼 Founder Wallet (Internal Credit)</option>
+                                </select>
+                            </div>
+
+                            {paymentMethod === 'founder_wallet' && (
+                                <div className="p-3 bg-purple-50 border border-purple-100 rounded-xl">
+                                    <label className="text-xs font-semibold text-purple-800 block mb-1.5">Select Founder *</label>
+                                    <select
+                                        value={paymentReference}
+                                        onChange={e => setPaymentReference(e.target.value)}
+                                        className="w-full border border-purple-200 rounded-lg px-3 py-2 text-sm outline-none bg-white focus:border-purple-400 transition-colors">
+                                        <option value="">Select a founder...</option>
+                                        {profiles.map(p => (
+                                            <option key={p.id} value={p.id}>{p.full_name}</option>
+                                        ))}
+                                    </select>
+                                    <p className="text-[10px] text-purple-600 mt-2 font-medium">
+                                        This will deduct the order total from their internal contribution balance instead of counting as real cash revenue.
+                                    </p>
+                                </div>
+                            )}
                         </div>
                         <div className="p-5 pt-0 flex gap-2">
                             <button
@@ -3725,7 +3772,7 @@ async function fulfillStandardItem(item) {
                             </button>
                             <button
                                 onClick={confirmPaidDate}
-                                disabled={confirmingPaidDate || !paidDateOverride}
+                                disabled={confirmingPaidDate || (paymentMethod === 'founder_wallet' && !paymentReference)}
                                 className="flex-[2] py-2.5 bg-emerald-500 hover:bg-emerald-600 disabled:opacity-50 text-white rounded-xl text-sm font-bold transition-colors"
                             >
                                 {confirmingPaidDate ? 'Saving...' : '💰 Mark as Paid'}

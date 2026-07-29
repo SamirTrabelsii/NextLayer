@@ -103,7 +103,7 @@ export default function Dashboard() {
             { data: settledConsignments },
             { data: resellerSales },
         ] = await Promise.all([
-            supabase.from('orders').select('id,status,total_price,is_paid,created_at,paid_at,deadline,type,clients(name)'),
+            supabase.from('orders').select('id,status,total_price,is_paid,created_at,paid_at,deadline,type,payment_method,clients(name)'),
             supabase.from('expenses').select('amount,date,category'),
             supabase.from('clients').select('id'),
             supabase.from('products').select('id,is_active'),
@@ -147,9 +147,9 @@ export default function Dashboard() {
 
         // Use paid_at for revenue — exact moment money was received
         const paidThisMonth = allOrders.filter(o =>
-            o.is_paid && (o.paid_at || o.created_at)?.startsWith(thisMonth))
+            o.is_paid && o.payment_method !== 'founder_wallet' && (o.paid_at || o.created_at)?.startsWith(thisMonth))
         const paidLastMonth = allOrders.filter(o =>
-            o.is_paid && (o.paid_at || o.created_at)?.startsWith(lastMonth))
+            o.is_paid && o.payment_method !== 'founder_wallet' && (o.paid_at || o.created_at)?.startsWith(lastMonth))
 
         const directRevThis = paidThisMonth.reduce((s, o) => s + (o.total_price || 0), 0)
         const directRevLast = paidLastMonth.reduce((s, o) => s + (o.total_price || 0), 0)
@@ -176,7 +176,7 @@ export default function Dashboard() {
         // Monthly financials also use paid_at
         const monthlyFinancials = months.map(m => {
             const directRev = allOrders
-                .filter(o => o.is_paid && (o.paid_at || o.created_at)?.startsWith(m.key))
+                .filter(o => o.is_paid && o.payment_method !== 'founder_wallet' && (o.paid_at || o.created_at)?.startsWith(m.key))
                 .reduce((s, o) => s + (o.total_price || 0), 0)
             const resellerRev = resellerRevByMonth[m.key] || 0
             const totalRev = directRev + resellerRev

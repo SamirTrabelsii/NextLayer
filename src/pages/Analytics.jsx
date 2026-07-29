@@ -192,7 +192,7 @@ export default function Analytics() {
             { data: resellerSales },
             { data: resellerConsignments },
         ] = await Promise.all([
-            supabase.from('orders').select('id,status,total_price,is_paid,created_at,paid_at,deadline,type,client_id,clients(id,name)'),
+            supabase.from('orders').select('id,status,total_price,is_paid,created_at,paid_at,deadline,type,payment_method,client_id,clients(id,name)'),
             supabase.from('expenses').select('id,amount,date,category'),
             supabase.from('clients').select('id,name,created_at'),
             supabase.from('products').select('id,name,category,selling_price,production_cost,is_active'),
@@ -218,7 +218,7 @@ export default function Analytics() {
         const { orders, expenses, clients, products, productions, orderItems, resellerSales, resellerConsignments } = raw
 
         // ── Helpers ──
-        const paidOrders = orders.filter(o => o.is_paid)
+        const paidOrders = orders.filter(o => o.is_paid && o.payment_method !== 'founder_wallet')
         const allMonthKeys = new Set()
 
         // Gather all months from orders and expenses
