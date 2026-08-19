@@ -3,15 +3,7 @@ import { supabase } from '../lib/supabase'
 import { Plus, X, Trash2, Shield, User } from 'lucide-react'
 import { createClient } from '@supabase/supabase-js'
 
-const adminKey = import.meta.env.VITE_SUPABASE_SECRET_ROLE_KEY || import.meta.env.VITE_SUPABASE_SERVICE_ROLE_KEY
-const supabaseAdmin = (import.meta.env.VITE_SUPABASE_URL && adminKey)
-  ? createClient(import.meta.env.VITE_SUPABASE_URL, adminKey, {
-      auth: {
-        persistSession: false,
-        autoRefreshToken: false,
-      }
-    })
-  : null
+
 
 
 export default function UserManagement() {
@@ -46,30 +38,29 @@ export default function UserManagement() {
       setError('Select the reseller client account for this user.')
       return
     }
-    if (!supabaseAdmin) {
-      setError('Supabase Admin Key (service_role) is missing in environment variables. User creation is disabled.')
-      return
-    }
     setSaving(true)
     setError('')
     try {
-      // Create auth user via Supabase admin API
-      const { data, error: signUpErr } = await supabaseAdmin.auth.admin.createUser({
-        email:    form.email,
-        password: form.password,
-        email_confirm: true,
-      })
-      if (signUpErr) throw signUpErr
+      const { data: { session } } = await supabase.auth.getSession();
+      const token = session?.access_token;
+      
+      const res = await fetch('/api/admin-users', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`
+        },
+        body: JSON.stringify({
+          email: form.email,
+          password: form.password,
+          full_name: form.full_name,
+          role: form.role,
+          reseller_client_id: form.role === 'reseller' ? form.reseller_client_id : null,
+        })
+      });
 
-      // Create profile
-      const { error: profileErr } = await supabase.from('profiles').insert([{
-        id:                 data.user.id,
-        email:              form.email,
-        full_name:          form.full_name,
-        role:               form.role,
-        reseller_client_id: form.role === 'reseller' ? form.reseller_client_id : null,
-      }])
-      if (profileErr) throw profileErr
+      const responseData = await res.json();
+      if (!res.ok) throw new Error(responseData.error || 'Failed to create user');
 
       setShowModal(false)
       setForm({ email:'', password:'', full_name:'', role:'reseller', reseller_client_id:'' })
@@ -84,16 +75,26 @@ export default function UserManagement() {
 
   async function deleteUser(userId) {
     if (!confirm('Delete this user? They will lose access immediately.')) return
-    if (!supabaseAdmin) {
-      alert('Supabase Admin Key (service_role) is missing in environment variables. User deletion is disabled.')
-      return
-    }
     try {
-      await supabaseAdmin.auth.admin.deleteUser(userId)
-      await supabase.from('profiles').delete().eq('id', userId)
+      const { data: { session } } = await supabase.auth.getSession();
+      const token = session?.access_token;
+
+      const res = await fetch('/api/admin-users', {
+        method: 'DELETE',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`
+        },
+        body: JSON.stringify({ userId })
+      });
+
+      const responseData = await res.json();
+      if (!res.ok) throw new Error(responseData.error || 'Failed to delete user');
+
       fetchAll()
     } catch (err) {
       console.error(err)
+      alert(err.message || 'Failed to delete user.')
     }
   }
 
